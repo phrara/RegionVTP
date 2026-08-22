@@ -1,0 +1,59 @@
+# RegionAgile
+
+**Query-conditioned, region-adaptive visual token pruning for LVLMs** — a training-free extension of [AgilePruner](https://github.com/cvsp-lab/AgilePruner) (ICLR 2026).
+
+## 定位
+
+在 AgilePruner 的免训练 attention + diversity 混合剪枝之上，加入两点改进，目标是在相同压缩效率（保留 64 / 128 visual token）下超过 AgilePruner 基线（64 → 95.4%，128 → 97.4%）：
+
+1. **Query-conditioned relevance** —— 用问题文本的 LLM 词嵌入对视觉 token 加权，让保留的 token 对齐「问题在问什么」，缓解幻觉。
+2. **Region-adaptive budget** —— 把 576 token 还原成 24×24 空间网格，按区域重要性/复杂度分配局部预算，再在区域内做 attention+diversity 剪枝，强制空间覆盖。
+
+完整设计见 vault 文档：`mllm/vi-token-reduction/RegionAgile-设计.md`。
+
+## 状态
+
+**脚手架阶段** —— 当前代码是 AgilePruner 的未改动 fork（`llava/model/llava_arch.py` 尚未修改）。计划中的实现点：
+
+- `select_tokens_regionwise(...)` 新函数（区域级 selection）
+- `encode_images` 增加 `query_embeds` 参数
+- `prepare_inputs_labels_for_multimodal` 计算 query 向量
+
+## 计划中的消融开关（env var）
+
+| env var | 含义 | 默认 |
+|---|---|---|
+| `QUERY_LAMBDA` | λ∈[0,1]，1=纯 CLS 注意力（=原版） | 0.5 |
+| `REGION_SIZE` | R（0=关 region，退化原版） | 4 |
+| `REGION_GAMMA` | complexity 指数 | 1.0 |
+| `BUDGET_MODE` | waterfill / softmax | waterfill |
+| `DIST_THRESHOLD` | 静态 tau（沿用 AgilePruner） | None |
+
+硬约束：`λ=1, R=0` 必须 bit-exact 复现 AgilePruner。
+
+## 环境
+
+```bash
+conda create -n regionagile python=3.10 -y
+conda activate regionagile
+pip install -e .
+# 可选加速
+pip install flash-attn --no-build-isolation
+```
+
+## 模型与数据
+
+- 模型：`liuhaotian/llava-v1.5-7b`
+- 数据：按 [EVAL.md](EVAL.md) 下载
+
+## 评测
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/v1_5/eval/pope.sh 64
+# 打开开关
+QUERY_LAMBDA=0.5 REGION_SIZE=4 CUDA_VISIBLE_DEVICES=0 bash scripts/v1_5/eval/pope.sh 64
+```
+
+## 致谢
+
+基于 [AgilePruner](https://github.com/cvsp-lab/AgilePruner)（fork 自其 `main`），其又基于 [LLaVA](https://github.com/haotian-liu/LLaVA) 与 [FasterVLM](https://github.com/Theia-4869/FasterVLM)。许可证沿用 Apache 2.0。

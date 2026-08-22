@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# Model weights / checkpoints
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+checkpoints/
+
+# Data (keep small jsonl/json/txt annotations used by eval scripts, ignore images & train)
+playground/
+!playground/
+!playground/data/
+!playground/data/**/
+!playground/data/**/*.jsonl
+!playground/data/**/*.json
+!playground/data/**/*.txt
+playground/data/train/
+
+# Env / secrets
+.env
+.env.*
+
+# Logs / runtime
+logs/
+*.log
+wandb/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
