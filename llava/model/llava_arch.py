@@ -268,7 +268,10 @@ def select_tokens_regionwise(
     3. Within each region, run the attention+diversity greedy selection with the region's
        own erank (region-aware adaptive tau), then map back to global indices.
     """
-    score = ranking[0]           # (N,)
+    score = ranking[0].float()   # (N,)
+    # z-score so region importance is on a consistent scale whether `ranking` is raw
+    # CLS attention (λ=1) or the blended query relevance (λ<1).
+    score = (score - score.mean()) / (score.std() + 1e-8)
     feats = image_features[0]    # (N, D)
     N = score.shape[0]
     device = score.device
