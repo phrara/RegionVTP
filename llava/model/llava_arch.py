@@ -217,6 +217,114 @@ def select_diverse_tokens_by_attention_and_distance(
 
     return torch.tensor(selected_indices, device=device)
 
+
+def allocate_budget(weights, total, mode="waterfill"):
+    """Distribute exactly `total` tokens across regions by `weights` (non-negative, sums to 1).
+
+    waterfill: give every region a floor of 1 first (spatial coverage), then split the
+               remaining budget by weight via largest-remainder rounding.
+    softmax:   pure proportional split (largest-remainder rounding), regions may get 0.
+    """
+    n = weights.numel()
+    device = weights.device
+    if mode == "waterfill" and total >= n:
+        base = torch.ones(n, dtype=torch.long, device=device)
+        exact = weights * float(total - n)
+        extra = exact.floor().long()
+        rem = exact - extra.float()
+        deficit = int(total - n - extra.sum().item())
+        if deficit > 0:
+            _, order = torch.sort(rem, descending=True)
+            extra[order[:deficit]] += 1
+        return base + extra
+    else:
+        exact = weights * float(total)
+        budget = exact.floor().long()
+        rem = exact - budget.float()
+        deficit = int(total - budget.sum().item())
+        if deficit > 0:
+            _, order = torch.sort(rem, descending=True)
+            budget[order[:deficit]] += 1
+        return budget
+
+
+def select_tokens_regionwise(
+    ranking,
+    d,
+    image_features,
+    max_tokens,
+    side,
+    R,
+    gamma=1.0,
+    budget_mode="waterfill",
+    static_tau=None,
+    erank_avg=ERANK_AVG_REF,
+    tau_max=TAU_MAX,
+):
+    """Region-adaptive visual token pruning (design doc §1 ②③④⑤):
+    1. Reshape the N tokens to a (side, side) grid and split into R*R square regions.
+    2. Score each region by mean relevance (ranking) and feature diversity (effective_rank),
+       then allocate an adaptive local budget across regions.
+    3. Within each region, run the attention+diversity greedy selection with the region's
+       own erank (region-aware adaptive tau), then map back to global indices.
+    """
+    score = ranking[0]           # (N,)
+    feats = image_features[0]    # (N, D)
+    N = score.shape[0]
+    device = score.device
+    hw = side // R
+
+    idx2d = torch.arange(N, device=device).view(side, side)
+    regions = idx2d.view(R, hw, R, hw).permute(0, 2, 1, 3).reshape(R * R, hw * hw)  # (R*R, hw*hw)
+
+    imp, comp = [], []
+    for r in range(R * R):
+        idx_r = regions[r]
+        imp.append(score[idx_r].mean().item())
+        comp.append(effective_rank(feats[idx_r]).item())
+    imp = torch.tensor(imp, device=device, dtype=torch.float32)
+    comp = torch.tensor(comp, device=device, dtype=torch.float32)
+
+    # importance + gamma * log(complexity) in log-space for numerical stability
+    logits = imp + gamma * torch.log(comp + 1e-8)
+    weights = torch.softmax(logits, dim=0)  # (R*R,)
+
+    budget = allocate_budget(weights, max_tokens, mode=budget_mode)  # (R*R,), sums to max_tokens
+
+    selected = []
+    for r in range(R * R):
+        b = min(int(budget[r].item()), int(regions[r].numel()))
+        if b <= 0:
+            continue
+        idx_r = regions[r]
+        score_r = score[idx_r].unsqueeze(0)      # (1, hw*hw)
+        d_r = d[idx_r][:, idx_r]                 # (hw*hw, hw*hw)
+        local = select_diverse_tokens_by_attention_and_distance(
+            score_r, d_r,
+            erank_input=comp[r].item(),
+            max_tokens=b,
+            static_tau=static_tau,
+            erank_avg=erank_avg,
+            tau_max=tau_max,
+        )
+        selected.append(idx_r[local])
+
+    selected_idx = torch.cat(selected) if selected else torch.empty(0, dtype=torch.long, device=device)
+
+    # Safety net: guarantee exactly max_tokens (rounding / b > region-size edge cases).
+    if selected_idx.numel() < max_tokens:
+        chosen = set(selected_idx.tolist())
+        for i in torch.argsort(score, descending=True):
+            if selected_idx.numel() >= max_tokens:
+                break
+            ii = i.item()
+            if ii not in chosen:
+                selected_idx = torch.cat([selected_idx, i.unsqueeze(0)])
+                chosen.add(ii)
+
+    return selected_idx
+
+
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -261,9 +369,22 @@ class LlavaMetaForCausalLM(ABC):
             sim_n = (sim - sim.mean(dim=-1, keepdim=True)) / (sim.std(dim=-1, keepdim=True) + 1e-8)
             ranking = lam * attn_n + (1.0 - lam) * sim_n
 
-        token_indices = select_diverse_tokens_by_attention_and_distance(
-            ranking, d, erank_input=erank.item(), max_tokens=visual_token_num, static_tau=static_tau
-        )
+        # [RegionVTP] Region-adaptive budget: when REGION_SIZE>1, split the square grid into
+        # R*R regions, allocate a local budget by relevance+complexity, and prune per-region.
+        R = int(os.environ.get("REGION_SIZE", "0"))
+        side = int(round(N ** 0.5))
+        if R > 1 and side * side == N and side % R == 0:
+            gamma = float(os.environ.get("REGION_GAMMA", "1.0"))
+            budget_mode = os.environ.get("BUDGET_MODE", "waterfill")
+            token_indices = select_tokens_regionwise(
+                ranking, d, image_features,
+                max_tokens=visual_token_num, side=side, R=R,
+                gamma=gamma, budget_mode=budget_mode, static_tau=static_tau,
+            )
+        else:
+            token_indices = select_diverse_tokens_by_attention_and_distance(
+                ranking, d, erank_input=erank.item(), max_tokens=visual_token_num, static_tau=static_tau
+            )
 
         top_indices = token_indices.unsqueeze(0)
         index_masks = torch.zeros(B, N, dtype=torch.bool, device=image_features.device) # (B, N)

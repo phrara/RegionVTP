@@ -14,14 +14,14 @@
 ## 状态
 
 - ✅ **Query-conditioned relevance（M1+M2）**：`encode_images` 增加 `query_embeds` 参数；`prepare_inputs_labels_for_multimodal` 取 `<image>` 之后的问题 token 求均值得到问题向量（去掉了 system prompt 稀释）；`QUERY_LAMBDA` 开关融合。`λ=1`（默认）与原版 AgilePruner bit-exact。
-- ⬜ **Region-adaptive budget（M3）**：`select_tokens_regionwise(...)` 新函数（区域级 selection + 局部 erank + 局部预算）。
+- ✅ **Region-adaptive budget（M3）**：`select_tokens_regionwise(...)` + `allocate_budget(...)` 新函数；`REGION_SIZE` 开启 R×R 区域划分、局部 erank、局部预算（waterfill/softmax），区域内跑 attention+diversity 贪心。
 
 ## 计划中的消融开关（env var）
 
 | env var | 含义 | 默认 |
 |---|---|---|
-| `QUERY_LAMBDA` | λ∈[0,1]，1=纯 CLS 注意力（=原版） | 0.5 |
-| `REGION_SIZE` | R（0=关 region，退化原版） | 4 |
+| `QUERY_LAMBDA` | λ∈[0,1]，1=纯 CLS 注意力（=原版） | 1.0（关，推荐 0.5） |
+| `REGION_SIZE` | R（0=关 region，退化原版） | 0（关，推荐 4） |
 | `REGION_GAMMA` | complexity 指数 | 1.0 |
 | `BUDGET_MODE` | waterfill / softmax | waterfill |
 | `DIST_THRESHOLD` | 静态 tau（沿用 AgilePruner） | None |
