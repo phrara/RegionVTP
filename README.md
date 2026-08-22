@@ -13,11 +13,8 @@
 
 ## 状态
 
-**脚手架阶段** —— 当前代码是 AgilePruner 的未改动 fork（`llava/model/llava_arch.py` 尚未修改）。计划中的实现点：
-
-- `select_tokens_regionwise(...)` 新函数（区域级 selection）
-- `encode_images` 增加 `query_embeds` 参数
-- `prepare_inputs_labels_for_multimodal` 计算 query 向量
+- ✅ **Query-conditioned relevance（M1+M2）**：`encode_images` 增加 `query_embeds` 参数，`prepare_inputs_labels_for_multimodal` 计算问题向量，`QUERY_LAMBDA` 开关融合。`λ=1`（默认）与原版 AgilePruner bit-exact。
+- ⬜ **Region-adaptive budget（M3）**：`select_tokens_regionwise(...)` 新函数（区域级 selection + 局部 erank + 局部预算）。
 
 ## 计划中的消融开关（env var）
 

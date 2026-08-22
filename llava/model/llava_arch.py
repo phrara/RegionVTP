@@ -227,7 +227,7 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
 
-    def encode_images(self, images):
+    def encode_images(self, images, query_embeds=None):
         image_features, image_attentions = self.get_model().get_vision_tower()(images) # (B, N, C), (B, M, N)
         B, N, C = image_features.shape
 
@@ -248,8 +248,21 @@ class LlavaMetaForCausalLM(ABC):
         cos_sim = torch.mm(feats_norm_squeezed, feats_norm_squeezed.t())  # (N, N)
         d = 1.0 - cos_sim   # (N, N)
 
+        # [RegionVTP] Query-conditioned relevance: blend CLS->patch attention with question
+        # embedding similarity. QUERY_LAMBDA=1.0 (default) reproduces AgilePruner exactly.
+        lam = float(os.environ.get("QUERY_LAMBDA", "1.0"))
+        ranking = image_attentions  # (B, N) raw CLS->patch attention, used as the ranking score
+        if query_embeds is not None and lam < 1.0:
+            q = query_embeds / (query_embeds.norm() + 1e-8)
+            query_sim = torch.einsum('bnd,d->bn', image_features.float(), q.float())  # (B, N)
+            attn = image_attentions.float()
+            sim = query_sim
+            attn_n = (attn - attn.mean(dim=-1, keepdim=True)) / (attn.std(dim=-1, keepdim=True) + 1e-8)
+            sim_n = (sim - sim.mean(dim=-1, keepdim=True)) / (sim.std(dim=-1, keepdim=True) + 1e-8)
+            ranking = lam * attn_n + (1.0 - lam) * sim_n
+
         token_indices = select_diverse_tokens_by_attention_and_distance(
-            image_attentions, d, erank_input=erank.item(), max_tokens=visual_token_num, static_tau=static_tau
+            ranking, d, erank_input=erank.item(), max_tokens=visual_token_num, static_tau=static_tau
         )
 
         top_indices = token_indices.unsqueeze(0)
@@ -276,11 +289,19 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
+        # [RegionVTP] Query embedding for query-conditioned relevance: mean LLM embedding of
+        # the non-image tokens, compared by cosine to the projected visual features.
+        query_embeds = None
+        if float(os.environ.get("QUERY_LAMBDA", "1.0")) < 1.0:
+            query_ids = input_ids[input_ids != IMAGE_TOKEN_INDEX]
+            if query_ids.numel() > 0:
+                query_embeds = self.get_model().embed_tokens(query_ids).mean(dim=0)  # (D,)
+
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features, index_masks, image_attns = self.encode_images(concat_images)
+            image_features, index_masks, image_attns = self.encode_images(concat_images, query_embeds=query_embeds)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             index_masks = torch.split(index_masks, split_sizes, dim=0)
@@ -350,7 +371,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features, index_masks, image_attns = self.encode_images(images)
+            image_features, index_masks, image_attns = self.encode_images(images, query_embeds=query_embeds)
             new_image_features = []
             for image_feature, index_mask in zip(image_features, index_masks):
                 image_feature = image_feature[index_mask]
