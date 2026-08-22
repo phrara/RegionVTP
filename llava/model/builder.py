@@ -159,6 +159,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             vision_tower.to(device=device_map, dtype=torch.float16)
         image_processor = vision_tower.image_processor
 
+        # [RegionVTP] stash the tokenizer on the model so prepare_inputs can decode the
+        # question back to raw text for the CLIP text tower (different vocab from the LLM).
+        model.tokenizer = tokenizer
+
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length
     else:

@@ -31,6 +31,34 @@ n_rank = 0.0
 n_sample = 0
 erank_log = []
 
+# --- [RegionVTP] CLIP text tower (question encoder) ---
+_CLIP_TEXT = None
+_CLIP_TOK = None
+
+
+def _get_clip_text(model_name):
+    """Load the CLIP text tower + projection heads from the SAME checkpoint the vision
+    tower uses (clip-vit-large-patch14-336 is a full CLIP model: vision + text + both
+    projections). Kept on CPU; only the ~1MB visual_projection is moved to GPU on demand."""
+    global _CLIP_TEXT, _CLIP_TOK
+    if _CLIP_TEXT is None:
+        from transformers import CLIPModel, CLIPTokenizer
+        _CLIP_TEXT = CLIPModel.from_pretrained(model_name).eval()
+        for p in _CLIP_TEXT.parameters():
+            p.requires_grad_(False)
+        _CLIP_TOK = CLIPTokenizer.from_pretrained(model_name)
+    return _CLIP_TEXT, _CLIP_TOK
+
+
+def encode_query(text, model_name, device, dtype):
+    """Raw question string -> 512-dim L2-normalized CLIP text embedding (joint space)."""
+    clip, tok = _get_clip_text(model_name)
+    with torch.no_grad():
+        ids = tok(text, return_tensors="pt", truncation=True, max_length=77)
+        q = clip.get_text_features(**ids)   # (1, 512), already text_projection + L2 norm
+    return q[0].to(device=device, dtype=dtype)
+
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -342,6 +370,9 @@ class LlavaMetaForCausalLM(ABC):
         image_features, image_attentions = self.get_model().get_vision_tower()(images) # (B, N, C), (B, M, N)
         B, N, C = image_features.shape
 
+        # [RegionVTP] keep pre-projector patch features for CLIP-space query relevance
+        patch_1024 = image_features
+
         visual_token_num = self.get_visual_token_num() # T
         image_attentions = image_attentions.mean(dim=1) # (B, N)
         image_features = self.get_model().mm_projector(image_features) # (B, N, D)
@@ -364,8 +395,14 @@ class LlavaMetaForCausalLM(ABC):
         lam = float(os.environ.get("QUERY_LAMBDA", "1.0"))
         ranking = image_attentions  # (B, N) raw CLS->patch attention, used as the ranking score
         if query_embeds is not None and lam < 1.0:
-            q = query_embeds / (query_embeds.norm() + 1e-8)
-            query_sim = torch.einsum('bnd,d->bn', image_features.float(), q.float())  # (B, N)
+            # [RegionVTP] cosine in CLIP's 512-dim joint space: project pre-projector patches
+            # via visual_projection and compare to the CLIP text embedding of the question.
+            clip, _ = _get_clip_text(os.environ.get("CLIP_TEXT_MODEL") or self.get_vision_tower().vision_tower_name)
+            vp = clip.visual_projection.weight.detach().to(device=image_features.device, dtype=torch.float32)
+            v512 = patch_1024.float() @ vp.t()  # (B, N, 512)
+            v512 = v512 / (v512.norm(dim=-1, keepdim=True) + 1e-8)
+            q = query_embeds.float() / (query_embeds.float().norm() + 1e-8)  # (512,)
+            query_sim = torch.einsum('bnd,d->bn', v512, q)  # (B, N)
             attn = image_attentions.float()
             sim = query_sim
             attn_n = (attn - attn.mean(dim=-1, keepdim=True)) / (attn.std(dim=-1, keepdim=True) + 1e-8)
@@ -413,17 +450,20 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        # [RegionVTP] Query embedding for query-conditioned relevance: mean LLM embedding of
-        # the question text, compared by cosine to the projected visual features. The question
-        # follows the last <image> token, so we take tokens after it — dropping the constant
-        # system prompt that would otherwise dilute the query signal. Assumes batch_size=1.
+        # [RegionVTP] Query embedding for query-conditioned relevance: encode the question
+        # with the CLIP text tower (same checkpoint as the vision tower) into its 512-dim
+        # joint space, compared by cosine to the visual_projection of pre-projector patches.
+        # The question follows the last <image> token; taking tokens after it drops the
+        # constant system prompt. Assumes batch_size=1.
         query_embeds = None
         if float(os.environ.get("QUERY_LAMBDA", "1.0")) < 1.0:
             img_idx = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().flatten()
             if img_idx.numel() > 0:
                 query_ids = input_ids[0, img_idx[-1] + 1:]
                 if query_ids.numel() > 0:
-                    query_embeds = self.get_model().embed_tokens(query_ids).mean(dim=0)  # (D,)
+                    text = self.tokenizer.decode(query_ids, skip_special_tokens=True)
+                    model_name = os.environ.get("CLIP_TEXT_MODEL") or vision_tower.vision_tower_name
+                    query_embeds = encode_query(text, model_name, device=input_ids.device, dtype=input_ids.dtype)  # (512,)
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
