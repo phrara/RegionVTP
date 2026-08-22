@@ -39,3 +39,5 @@ wandb/
 Thumbs.db
 .vscode/
 .idea/
+
+playground/data/eval/
