@@ -1,7 +1,7 @@
 #!/bin/bash
 
 CKPT="llava-v1.5-7b"
-METHOD="agilepruner"
+METHOD="${METHOD:-regionvtp}"
 TOKEN=${1}
 PARAM="n_${TOKEN}"
 

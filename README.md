@@ -13,7 +13,7 @@
 
 ## 状态
 
-- ✅ **Query-conditioned relevance（M1+M2）**：`encode_images` 增加 `query_embeds` 参数，`prepare_inputs_labels_for_multimodal` 计算问题向量，`QUERY_LAMBDA` 开关融合。`λ=1`（默认）与原版 AgilePruner bit-exact。
+- ✅ **Query-conditioned relevance（M1+M2）**：`encode_images` 增加 `query_embeds` 参数；`prepare_inputs_labels_for_multimodal` 取 `<image>` 之后的问题 token 求均值得到问题向量（去掉了 system prompt 稀释）；`QUERY_LAMBDA` 开关融合。`λ=1`（默认）与原版 AgilePruner bit-exact。
 - ⬜ **Region-adaptive budget（M3）**：`select_tokens_regionwise(...)` 新函数（区域级 selection + 局部 erank + 局部预算）。
 
 ## 计划中的消融开关（env var）

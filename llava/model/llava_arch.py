@@ -290,12 +290,16 @@ class LlavaMetaForCausalLM(ABC):
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         # [RegionVTP] Query embedding for query-conditioned relevance: mean LLM embedding of
-        # the non-image tokens, compared by cosine to the projected visual features.
+        # the question text, compared by cosine to the projected visual features. The question
+        # follows the last <image> token, so we take tokens after it — dropping the constant
+        # system prompt that would otherwise dilute the query signal. Assumes batch_size=1.
         query_embeds = None
         if float(os.environ.get("QUERY_LAMBDA", "1.0")) < 1.0:
-            query_ids = input_ids[input_ids != IMAGE_TOKEN_INDEX]
-            if query_ids.numel() > 0:
-                query_embeds = self.get_model().embed_tokens(query_ids).mean(dim=0)  # (D,)
+            img_idx = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().flatten()
+            if img_idx.numel() > 0:
+                query_ids = input_ids[0, img_idx[-1] + 1:]
+                if query_ids.numel() > 0:
+                    query_embeds = self.get_model().embed_tokens(query_ids).mean(dim=0)  # (D,)
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
