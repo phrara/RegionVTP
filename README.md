@@ -1,6 +1,6 @@
-# RegionAgile
+# RegionVTP
 
-**Query-conditioned, region-adaptive visual token pruning for LVLMs** — a training-free extension of [AgilePruner](https://github.com/cvsp-lab/AgilePruner) (ICLR 2026).
+**Region-adaptive visual token pruning for LVLMs (query-conditioned, training-free)** — a training-free extension of [AgilePruner](https://github.com/cvsp-lab/AgilePruner) (ICLR 2026).
 
 ## 定位
 
@@ -9,7 +9,7 @@
 1. **Query-conditioned relevance** —— 用问题文本的 LLM 词嵌入对视觉 token 加权，让保留的 token 对齐「问题在问什么」，缓解幻觉。
 2. **Region-adaptive budget** —— 把 576 token 还原成 24×24 空间网格，按区域重要性/复杂度分配局部预算，再在区域内做 attention+diversity 剪枝，强制空间覆盖。
 
-完整设计见 vault 文档：`mllm/vi-token-reduction/RegionAgile-设计.md`。
+完整设计见 vault 文档：`mllm/vi-token-reduction/RegionVTP-设计.md`。
 
 ## 状态
 
@@ -34,8 +34,8 @@
 ## 环境
 
 ```bash
-conda create -n regionagile python=3.10 -y
-conda activate regionagile
+conda create -n regionvtp python=3.10 -y
+conda activate regionvtp
 pip install -e .
 # 可选加速
 pip install flash-attn --no-build-isolation
