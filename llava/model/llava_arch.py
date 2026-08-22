@@ -246,6 +246,43 @@ def select_diverse_tokens_by_attention_and_distance(
     return torch.tensor(selected_indices, device=device)
 
 
+@torch.no_grad()
+def merge_pruned_tokens(image_features, kept_indices):
+    """ToMe-style token merging (Phase 1): fold each pruned token into its most similar
+    kept token by count-averaging their features, instead of discarding it. Preserves the
+    pruned information — the same "select + merge" recipe used by VScan / TokenCarve /
+    VisionTrim to stay accurate under high compression. Kept-token positions are unchanged;
+    only their features are enriched (pruned positions are ignored downstream).
+
+    image_features: (B, N, D) projected features. kept_indices: (T,) global kept indices.
+    """
+    B, N, D = image_features.shape
+    device = image_features.device
+    kept_indices = kept_indices.to(device)
+
+    kept_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    kept_mask[kept_indices] = True
+    pruned_mask = ~kept_mask
+    if pruned_mask.sum() == 0:
+        return image_features
+
+    kept_sorted = torch.nonzero(kept_mask, as_tuple=False).squeeze(-1)  # (K,) in index order
+    out = image_features.float().clone()
+    counts = torch.ones(B, N, device=device, dtype=torch.float32)
+    for b in range(B):
+        feats = out[b]  # (N, D) fp32
+        fn = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+        sim = fn @ fn.t()  # (N, N) cosine
+        sim_to_kept = sim[pruned_mask][:, kept_mask]  # (P, K)
+        nearest = kept_sorted[sim_to_kept.argmax(dim=1)]  # (P,) global kept idx
+        src = feats[pruned_mask]  # (P, D)
+        index = nearest.unsqueeze(1).expand_as(src)  # (P, D)
+        out[b] = out[b].scatter_add(0, index, src)
+        counts[b] = counts[b].scatter_add(0, nearest, torch.ones(src.shape[0], device=device, dtype=torch.float32))
+    out = out / counts.unsqueeze(-1)
+    return out.to(image_features.dtype)
+
+
 def allocate_budget(weights, total, mode="waterfill"):
     """Distribute exactly `total` tokens across regions by `weights` (non-negative, sums to 1).
 
@@ -433,6 +470,12 @@ class LlavaMetaForCausalLM(ABC):
             top_indices = top_indices.expand(B, -1)
 
         index_masks.scatter_(1, top_indices, True) # (B, N)
+
+        # [RegionVTP] Phase 1: ToMe-style merge — fold pruned tokens into their nearest
+        # kept token instead of discarding, preserving their information. Off by default
+        # so MERGE_MODE unset reproduces AgilePruner bit-exactly.
+        if os.environ.get("MERGE_MODE", "off") == "nearest":
+            image_features = merge_pruned_tokens(image_features, token_indices)
 
         global n_rank, n_sample, erank_log
         selected_erank = effective_rank(image_features[0][index_masks[0]])
