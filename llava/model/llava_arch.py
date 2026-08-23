@@ -630,7 +630,9 @@ class LlavaMetaForCausalLM(ABC):
         # The question follows the last <image> token; taking tokens after it drops the
         # constant system prompt. Assumes batch_size=1.
         query_embeds = None
-        if float(os.environ.get("QUERY_LAMBDA", "1.0")) < 1.0:
+        qpsca = (os.environ.get("SELECTOR", "agilepruner") == "prunesid"
+                 and os.environ.get("PRUNESID_QUERY", "0") == "1")
+        if float(os.environ.get("QUERY_LAMBDA", "1.0")) < 1.0 or qpsca:
             img_idx = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().flatten()
             if img_idx.numel() > 0:
                 query_ids = input_ids[0, img_idx[-1] + 1:]
