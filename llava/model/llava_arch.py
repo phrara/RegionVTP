@@ -394,7 +394,7 @@ def select_tokens_regionwise(
 
 
 @torch.no_grad()
-def select_tokens_prunesid(patch_features, attention, max_tokens):
+def select_tokens_prunesid(patch_features, attention, max_tokens, weights=None):
     """PRUNESID (ICLR 2026) PSCA-NMS, ported to the no-CLS LLaVA-1.5 pipeline.
 
     Selection = principal-semantic-component grouping (sigmoid + low-rank PCA of the
@@ -407,6 +407,10 @@ def select_tokens_prunesid(patch_features, attention, max_tokens):
 
     patch_features: (B, N, C) ViT penultimate-layer patch features (CLS already dropped).
     attention:      (B, N) CLS->patch attention from the same layer (mean over heads).
+    weights:        (N,) optional per-token covariance weight (Q-PSCA). When given, each
+                    token's contribution to the PCA covariance is scaled by sqrt(w), so the
+                    principal semantic directions become question-adaptive. Grouping only;
+                    the NMS score remains CLS attention.
     """
     x = patch_features[0].float()      # (N, C)
     attn = attention[0].float()        # (N,)
@@ -418,6 +422,11 @@ def select_tokens_prunesid(patch_features, attention, max_tokens):
     #    singular vectors V are the semantic directions; each token joins argmax_j |V_ij|.
     q = max(1, int(T / 4))                                  # number of semantic directions
     standard = torch.sigmoid(x).t()                         # (C, N)
+    if weights is not None:
+        # Q-PSCA: scale each token's covariance contribution by sqrt(question relevance),
+        # so the principal semantic directions rotate toward what the question asks about.
+        w = weights.to(device=dev, dtype=torch.float32).clamp(min=0.0)   # (N,)
+        standard = standard * torch.sqrt(w + 1e-8).unsqueeze(0)          # (C, N)
     _, _, V = torch.pca_lowrank(standard, q=q)              # V: (N, q), column-centered
     V = torch.abs(V)
     belong = torch.argmax(V, dim=-1)                        # (N,) group id per token
@@ -532,8 +541,12 @@ class LlavaMetaForCausalLM(ABC):
         # [RegionVTP] Query-conditioned relevance: blend CLS->patch attention with question
         # embedding similarity. QUERY_LAMBDA=1.0 (default) reproduces AgilePruner exactly.
         lam = float(os.environ.get("QUERY_LAMBDA", "1.0"))
+        # Q-PSCA: question-weighted PSCA grouping (PRUNESID covariance + cross-modal weight).
+        qpsca = (os.environ.get("SELECTOR", "agilepruner") == "prunesid"
+                 and os.environ.get("PRUNESID_QUERY", "0") == "1")
+        qpsca_weights = None
         ranking = image_attentions  # (B, N) raw CLS->patch attention, used as the ranking score
-        if query_embeds is not None and lam < 1.0:
+        if query_embeds is not None and (lam < 1.0 or qpsca):
             # [RegionVTP] cosine in CLIP's 512-dim joint space: project pre-projector patches
             # via visual_projection and compare to the CLIP text embedding of the question.
             clip, _ = _get_clip_text(os.environ.get("CLIP_TEXT_MODEL") or self.get_vision_tower().vision_tower_name)
@@ -542,11 +555,16 @@ class LlavaMetaForCausalLM(ABC):
             v512 = v512 / (v512.norm(dim=-1, keepdim=True) + 1e-8)
             q = query_embeds.float() / (query_embeds.float().norm() + 1e-8)  # (512,)
             query_sim = torch.einsum('bnd,d->bn', v512, q)  # (B, N)
-            attn = image_attentions.float()
-            sim = query_sim
-            attn_n = (attn - attn.mean(dim=-1, keepdim=True)) / (attn.std(dim=-1, keepdim=True) + 1e-8)
-            sim_n = (sim - sim.mean(dim=-1, keepdim=True)) / (sim.std(dim=-1, keepdim=True) + 1e-8)
-            ranking = lam * attn_n + (1.0 - lam) * sim_n
+            if qpsca:
+                # Q-PSCA: softmax over tokens -> covariance weight (sharpness via temperature).
+                t_q = float(os.environ.get("QPSPCA_TEMP", "0.5"))
+                qpsca_weights = torch.softmax(query_sim[0].float() / t_q, dim=0)  # (N,)
+            if lam < 1.0:
+                attn = image_attentions.float()
+                sim = query_sim
+                attn_n = (attn - attn.mean(dim=-1, keepdim=True)) / (attn.std(dim=-1, keepdim=True) + 1e-8)
+                sim_n = (sim - sim.mean(dim=-1, keepdim=True)) / (sim.std(dim=-1, keepdim=True) + 1e-8)
+                ranking = lam * attn_n + (1.0 - lam) * sim_n
 
         # [RegionVTP] Selection strategy. SELECTOR=prunesid switches to the PSCA-NMS
         # spectral-coverage selector (PRUNESID, ICLR 2026); default is AgilePruner's
@@ -561,6 +579,7 @@ class LlavaMetaForCausalLM(ABC):
             feats = image_features if space == "post" else patch_1024
             token_indices = select_tokens_prunesid(
                 feats, image_attentions, max_tokens=visual_token_num,
+                weights=qpsca_weights,
             )
         elif R > 1 and side * side == N and side % R == 0:
             gamma = float(os.environ.get("REGION_GAMMA", "1.0"))
