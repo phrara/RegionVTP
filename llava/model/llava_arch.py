@@ -645,6 +645,8 @@ class LlavaMetaForCausalLM(ABC):
         merge_nums = int(os.environ.get("TCARVE_MERGE", str(visual_token_num // 2)))
         sv_av_mode = int(os.environ.get("TCARVE_MODE", "0"))      # 0=fuse, 1=SV only, 2=AV only
         sv_av_weight = float(os.environ.get("TCARVE_WEIGHT", "0.5"))
+        qadp_diversity = int(os.environ.get("QADP_DIVERSITY", "0"))  # 1 = QADP diversity coverage
+        qadp_tau = float(os.environ.get("QADP_TAU", "0.2"))          # static similarity threshold
 
         embeds = inputs_embeds
         bsz, seq_len, dim = embeds.shape
@@ -687,7 +689,19 @@ class LlavaMetaForCausalLM(ABC):
         fused = torch.zeros(m, device=dev, dtype=torch.float32)
         fused[av_order] += idx_w * sv_av_weight
         fused[sv_order] += idx_w * (1.0 - sv_av_weight)
-        if sv_av_mode == 2:
+        if qadp_diversity == 1:
+            # QADP: question-adaptive diversity coverage (select-only). Rank by the fused
+            # relevance score, but greedily suppress candidates whose cosine distance to an
+            # already-selected token is below `qadp_tau` in the question-conditioned LLM space
+            # (layer-`work_layer` hidden states), spreading the budget across the image instead
+            # of over-focusing on one region. Reuses AgilePruner's greedy selector (Eq. 6).
+            norm_hid = img_hid / (img_hid.norm(dim=-1, keepdim=True) + 1e-8)
+            d_hid = 1.0 - (norm_hid @ norm_hid.t())                # (m, m) cosine distance
+            keep_local = select_diverse_tokens_by_attention_and_distance(
+                fused.unsqueeze(0), d_hid, effective_rank(img_hid).item(),
+                max_tokens=rank, static_tau=(qadp_tau if qadp_tau > 0 else None),
+            )
+        elif sv_av_mode == 2:
             keep_local = av_order[:rank]
         elif sv_av_mode == 1:
             keep_local = sv_order[:rank]
