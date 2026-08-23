@@ -555,8 +555,12 @@ class LlavaMetaForCausalLM(ABC):
         R = int(os.environ.get("REGION_SIZE", "0"))
         side = int(round(N ** 0.5))
         if selector == "prunesid":
+            # PRUNESID_SPACE: "pre" = ViT penultimate (1024-dim, the reference setting),
+            # "post" = post-mm_projector (4096-dim, the space that actually feeds the LLM).
+            space = os.environ.get("PRUNESID_SPACE", "pre")
+            feats = image_features if space == "post" else patch_1024
             token_indices = select_tokens_prunesid(
-                patch_1024, image_attentions, max_tokens=visual_token_num,
+                feats, image_attentions, max_tokens=visual_token_num,
             )
         elif R > 1 and side * side == N and side % R == 0:
             gamma = float(os.environ.get("REGION_GAMMA", "1.0"))
