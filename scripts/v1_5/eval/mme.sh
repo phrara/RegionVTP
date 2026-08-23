@@ -1,12 +1,16 @@
 #!/bin/bash
 
 CKPT="llava-v1.5-7b"
-METHOD="agilepruner"
+METHOD="${METHOD:-regionvtp}"
 TOKEN=${1}
 PARAM="n_${TOKEN}"
 
+# CLIP text tower checkpoint (question encoder for query-conditioned relevance).
+# Defaults to the local download on this server; override via the environment if needed.
+export CLIP_TEXT_MODEL="${CLIP_TEXT_MODEL:-/groups/g900403/home/share/phr/models/openai/clip-vit-large-patch14-336}"
+
 python -W ignore -m llava.eval.model_vqa_loader \
-    --model-path liuhaotian/${CKPT} \
+    --model-path /groups/g900403/home/share/phr/models/liuhaotian/llava-v1.5-7b \
     --question-file ./playground/data/eval/MME/llava_mme.jsonl \
     --image-folder ./playground/data/eval/MME/MME_Benchmark_release_version \
     --answers-file ./playground/data/eval/MME/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
