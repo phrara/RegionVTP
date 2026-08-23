@@ -524,7 +524,13 @@ class LlavaMetaForCausalLM(ABC):
         visual_token_num = self.get_visual_token_num() # T
         image_attentions = image_attentions.mean(dim=1) # (B, N)
         image_features = self.get_model().mm_projector(image_features) # (B, N, D)
-        
+
+        # [RegionVTP] TokenCarve: pruning happens inside the LLM (layer-2 rank-fusion), so the
+        # ViT passes its full patch set through the projector unpruned.
+        if os.environ.get("LLM_LAYER_PRUNE", "0") == "1":
+            full_mask = torch.ones(B, N, dtype=torch.bool, device=image_features.device)
+            return image_features, full_mask, image_attentions
+
         if visual_token_num >=576:
             return image_features, torch.ones(B, N, dtype=torch.bool, device=image_features.device), image_attentions
         
@@ -615,6 +621,121 @@ class LlavaMetaForCausalLM(ABC):
         erank_log.append(selected_erank.item())
 
         return image_features, index_masks, image_attentions
+
+    def token_carve_llm_prune(self, inputs_embeds, attention_mask, position_ids, sys_length, image_length):
+        """TokenCarve-style LLM-layer pruning (rank-fusion + prune-then-merge).
+
+        Runs the first `TCARVE_LAYER` decoder layers over the FULL image-token sequence to
+        obtain question-aware attention + contextualized hidden states, then re-selects a
+        subset of image tokens by fusing (i) the last input token's (question) attention to
+        each image token [AV] and (ii) each image token's SVD row contribution C_i = sum_j
+        |U_ij * sigma_j| in the contextualized space [SV]. The surviving top half is kept;
+        the most-similar tokens of the bottom half are folded (mean) into their nearest kept
+        token. Returns a shorter input the remaining layers process via a normal forward (a
+        full re-run from layer 0), which sidesteps KV-cache surgery. Faithful to TokenCarve's
+        SELECTION signal; the merge is applied at the input-embedding level rather than
+        in-place at layer 2 (documented deviation).
+
+        Assumes batch_size=1 and a single contiguous image-token block.
+        """
+        model = self.get_model()
+        visual_token_num = self.get_visual_token_num()
+        work_layer = int(os.environ.get("TCARVE_LAYER", "2"))
+        rank = int(os.environ.get("TCARVE_RANK", str(int(1.5 * visual_token_num))))
+        merge_nums = int(os.environ.get("TCARVE_MERGE", str(visual_token_num // 2)))
+        sv_av_mode = int(os.environ.get("TCARVE_MODE", "0"))      # 0=fuse, 1=SV only, 2=AV only
+        sv_av_weight = float(os.environ.get("TCARVE_WEIGHT", "0.5"))
+
+        embeds = inputs_embeds
+        bsz, seq_len, dim = embeds.shape
+        dev = embeds.device
+        dtype = embeds.dtype
+
+        rank = max(2, min(rank, image_length))
+
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=dev, dtype=torch.long).unsqueeze(0)
+
+        # 4D causal mask for the partial (prefill) forward over the full sequence.
+        causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
+        causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
+
+        # pass 1: layers 0..work_layer-1 over the full sequence -> question-aware attn + hidden.
+        hid = embeds
+        attn_w = None
+        for layer in model.layers[:work_layer]:
+            out = layer(hid, attention_mask=causal, position_ids=position_ids,
+                        use_cache=False, output_attentions=True)
+            hid = out[0]
+            attn_w = out[1]                                        # (B, heads, L, L)
+
+        img_slice = slice(sys_length, sys_length + image_length)
+
+        # AV: last input token's (question) attention to each image token, mean over heads.
+        q2img = attn_w.mean(dim=1)[0, -1, img_slice]               # (image_length,)
+        _, av_order = torch.sort(q2img, descending=True)
+
+        # SV: SVD row contribution of the contextualized image tokens.
+        img_hid = hid[0, img_slice, :].to(torch.float32)           # (image_length, D)
+        U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
+        row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)        # (image_length,)
+        _, sv_order = torch.sort(row_contrib, descending=True)
+
+        # rank fusion: positional weighting (TokenCarve AV/SV fusion).
+        m = image_length
+        idx_w = torch.arange(m, 0, -1, device=dev, dtype=torch.float32)
+        fused = torch.zeros(m, device=dev, dtype=torch.float32)
+        fused[av_order] += idx_w * sv_av_weight
+        fused[sv_order] += idx_w * (1.0 - sv_av_weight)
+        if sv_av_mode == 2:
+            keep_local = av_order[:rank]
+        elif sv_av_mode == 1:
+            keep_local = sv_order[:rank]
+        else:
+            keep_local = torch.topk(fused, rank).indices
+        keep_local = keep_local.to(device=dev, dtype=torch.long)   # (rank,) local image indices
+
+        # prune-then-merge: fold the most-similar B (bottom half) into A (top half) via cosine.
+        set_length = rank // 2
+        A_local = keep_local[:set_length]
+        B_local = keep_local[set_length:]
+        img_emb = embeds[0, img_slice, :].float()                  # (image_length, D)
+        norm = img_emb / (img_emb.norm(dim=-1, keepdim=True) + 1e-8)
+        sim = norm[B_local] @ norm[A_local].t()                    # (set_length, set_length)
+        sim_max, sim_arg = sim.max(dim=-1)
+        reduce_n = min(set_length, merge_nums)
+        order = torch.sort(sim_max, descending=True).indices
+        merge_B = B_local[order[:reduce_n]]
+        merge_A = A_local[sim_arg[order[:reduce_n]]]
+        remaining_B = B_local[order[reduce_n:]]
+
+        # merged image embeddings: mean of each A and the B folded into it; kept order = A + remaining B.
+        merged = img_emb.clone()
+        counts = torch.ones(image_length, device=dev, dtype=torch.float32)
+        merged.index_add_(0, merge_A, img_emb[merge_B])
+        counts.index_add_(0, merge_A, torch.ones(reduce_n, device=dev, dtype=torch.float32))
+        merged = merged / counts.unsqueeze(-1)
+        final_keep_local = torch.cat([A_local, remaining_B])
+        final_img_emb = merged[final_keep_local].to(dtype)         # (T_final, D)
+
+        # global keep indices: prefix + kept image tokens + suffix.
+        keep_global = torch.cat([
+            torch.arange(0, sys_length, device=dev, dtype=torch.long),
+            sys_length + final_keep_local,
+            torch.arange(sys_length + image_length, seq_len, device=dev, dtype=torch.long),
+        ])
+        new_embeds = embeds[:, keep_global, :]
+        new_attn_mask = attention_mask[:, keep_global] if attention_mask is not None else None
+        new_pos = torch.arange(new_embeds.shape[1], device=dev, dtype=torch.long).unsqueeze(0)
+
+        # [RegionVTP] report erank of the FINAL selection (the number that matters here).
+        global n_rank, n_sample, erank_log
+        er = effective_rank(final_img_emb)
+        n_rank += er.item()
+        n_sample += 1
+        erank_log.append(er.item())
+
+        return new_embeds, new_attn_mask, new_pos, keep_global, int(final_keep_local.numel())
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
@@ -828,6 +949,18 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        v_token_count = image_features[0].shape[0]
+
+        # [RegionVTP] TokenCarve: prune + merge image tokens inside the LLM (rank-fusion at an
+        # early layer). Batch-size-1 / single-image assumption, true for the eval harness.
+        if os.environ.get("LLM_LAYER_PRUNE", "0") == "1" and batch_size == 1:
+            img_idx_all = (_input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().flatten()
+            if img_idx_all.numel() > 0:
+                sys_length = int(img_idx_all[0].item())
+                image_length = int(image_features[0].shape[0])
+                new_input_embeds, attention_mask, position_ids, keep_global, v_token_count = self.token_carve_llm_prune(
+                    new_input_embeds, attention_mask, position_ids, sys_length, image_length)
+                new_labels_padded = new_labels_padded[:, keep_global]
 
         if _labels is None:
             new_labels = None
@@ -842,7 +975,7 @@ class LlavaMetaForCausalLM(ABC):
         if _position_ids is None:
             position_ids = None
 
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, image_features[0].shape[0], image_attns
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, v_token_count, image_attns
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
