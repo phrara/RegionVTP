@@ -393,6 +393,108 @@ def select_tokens_regionwise(
     return selected_idx
 
 
+@torch.no_grad()
+def select_tokens_prunesid(patch_features, attention, max_tokens):
+    """PRUNESID (ICLR 2026) PSCA-NMS, ported to the no-CLS LLaVA-1.5 pipeline.
+
+    Selection = principal-semantic-component grouping (sigmoid + low-rank PCA of the
+    ViT penultimate patch features) -> per-group CLS-attention ranking -> intra-group
+    NMS by cosine similarity -> per-group budget (floor 1, cap 5*ceil(T/64), the rest
+    proportional to NMS survivors). The PCA grouping forces every semantic direction to
+    be represented (coverage); attention still decides *which* token inside each group.
+    Returns a (T,) tensor of global patch indices (any order; downstream applies a bool
+    mask so the original spatial order is preserved).
+
+    patch_features: (B, N, C) ViT penultimate-layer patch features (CLS already dropped).
+    attention:      (B, N) CLS->patch attention from the same layer (mean over heads).
+    """
+    x = patch_features[0].float()      # (N, C)
+    attn = attention[0].float()        # (N,)
+    N = x.shape[0]
+    T = int(max_tokens)
+    dev = x.device
+
+    # 1) PSCA grouping: sigmoid-scale, then low-rank PCA over the token dim. The right
+    #    singular vectors V are the semantic directions; each token joins argmax_j |V_ij|.
+    q = max(1, int(T / 4))                                  # number of semantic directions
+    standard = torch.sigmoid(x).t()                         # (C, N)
+    _, _, V = torch.pca_lowrank(standard, q=q)              # V: (N, q), column-centered
+    V = torch.abs(V)
+    belong = torch.argmax(V, dim=-1)                        # (N,) group id per token
+
+    # 2) score = CLS attention, but only inside the token's own group (masked elsewhere).
+    #    (We rank by attention; |V| only determines grouping, matching the reference code.)
+
+    # 3) within-group cosine similarity + global redundancy -> adaptive NMS threshold.
+    xn = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+    sim = xn @ xn.t()                                       # (N, N)
+    triu = torch.triu(torch.ones_like(sim), diagonal=1).bool()
+    sim_mean = (sim * triu).sum() / triu.sum()              # scalar global redundancy
+    tau = (T / 32.0) * sim_mean                             # adaptive threshold
+    same_group = belong.unsqueeze(1) == belong.unsqueeze(0)  # (N, N)
+    group_sim = sim.clone()
+    group_sim[~same_group] = 0.0                            # suppress cross-group edges
+
+    # 4) intra-group NMS: greedy by attention, suppress cos-similar (>tau) same-group tokens.
+    group_kept = [[] for _ in range(q)]
+    alive = torch.ones(N, dtype=torch.bool, device=dev)
+    for i in torch.argsort(attn, descending=True).tolist():
+        if not alive[i]:
+            continue
+        alive[i] = False
+        group_kept[int(belong[i].item())].append(i)
+        alive[(group_sim[i] > tau) & alive] = False
+
+    keep_counts = torch.tensor([len(k) for k in group_kept], device=dev, dtype=torch.long)
+    group_counts = torch.tensor(
+        [(belong == g).sum().item() for g in range(q)], device=dev, dtype=torch.long)
+
+    # 5) per-group budget: floor 1 (coverage), cap, rest proportional to NMS survivors.
+    lower = torch.clamp(group_counts, max=1)                # 1 if group non-empty else 0
+    upper = torch.minimum(
+        torch.minimum(
+            torch.full((q,), 5 * math.ceil(T / 64), device=dev, dtype=torch.long),
+            group_counts),
+        keep_counts)
+    while int(upper.sum()) < T:                             # enlarge cap if NMS kept too few
+        upper = torch.minimum(upper + 1, group_counts)
+
+    other = max(int(T - lower.sum()), 0)                    # budget beyond the coverage floor
+    denom = keep_counts.sum().item()
+    norm = keep_counts.float() / (denom if denom > 0 else 1.0)
+    exact = norm * other
+    other_d = exact.floor().long()
+    rem = exact - exact.floor()
+    deficit = int(other - other_d.sum())
+    if deficit > 0:                                          # largest-remainder rounding
+        _, order = torch.sort(rem, descending=True)
+        other_d[order[:deficit]] += 1
+    budget = torch.minimum(other_d + lower, upper)
+
+    sort_idx = torch.argsort(keep_counts, descending=True).tolist()
+    fill = 0
+    while int(budget.sum()) < T and fill < q:               # fill leftover to exactly T
+        g = sort_idx[fill]
+        add = min(int(upper[g] - budget[g]), int(T - budget.sum()))
+        if add > 0:
+            budget[g] += add
+        fill += 1
+
+    # 6) take the top-budget tokens of each group (attention order), backfill if under.
+    selected = []
+    for g in range(q):
+        selected.extend(group_kept[g][:int(budget[g].item())])
+    if len(selected) < T:
+        have = set(selected)
+        for i in torch.argsort(attn, descending=True).tolist():
+            if len(selected) >= T:
+                break
+            if i not in have:
+                selected.append(i)
+                have.add(i)
+    return torch.tensor(selected[:T], device=dev, dtype=torch.long)
+
+
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -446,11 +548,17 @@ class LlavaMetaForCausalLM(ABC):
             sim_n = (sim - sim.mean(dim=-1, keepdim=True)) / (sim.std(dim=-1, keepdim=True) + 1e-8)
             ranking = lam * attn_n + (1.0 - lam) * sim_n
 
-        # [RegionVTP] Region-adaptive budget: when REGION_SIZE>1, split the square grid into
-        # R*R regions, allocate a local budget by relevance+complexity, and prune per-region.
+        # [RegionVTP] Selection strategy. SELECTOR=prunesid switches to the PSCA-NMS
+        # spectral-coverage selector (PRUNESID, ICLR 2026); default is AgilePruner's
+        # attention+diversity greedy. REGION_SIZE>1 still routes to the region selector.
+        selector = os.environ.get("SELECTOR", "agilepruner")
         R = int(os.environ.get("REGION_SIZE", "0"))
         side = int(round(N ** 0.5))
-        if R > 1 and side * side == N and side % R == 0:
+        if selector == "prunesid":
+            token_indices = select_tokens_prunesid(
+                patch_1024, image_attentions, max_tokens=visual_token_num,
+            )
+        elif R > 1 and side * side == N and side % R == 0:
             gamma = float(os.environ.get("REGION_GAMMA", "1.0"))
             budget_mode = os.environ.get("BUDGET_MODE", "waterfill")
             token_indices = select_tokens_regionwise(
