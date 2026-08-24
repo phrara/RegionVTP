@@ -647,6 +647,9 @@ class LlavaMetaForCausalLM(ABC):
         sv_av_weight = float(os.environ.get("TCARVE_WEIGHT", "0.5"))
         qadp_diversity = int(os.environ.get("QADP_DIVERSITY", "0"))  # 1 = QADP diversity coverage
         qadp_tau = float(os.environ.get("QADP_TAU", "0.2"))          # static similarity threshold
+        qadp_adaptive = int(os.environ.get("QADP_ADAPTIVE", "0"))    # 1 = erank-adaptive tau (Eq. 6)
+        qadp_erank_ref = float(os.environ.get("QADP_ERANK_REF", str(ERANK_AVG_REF)))
+        qadp_tau_max = float(os.environ.get("QADP_TAU_MAX", str(TAU_MAX)))
 
         embeds = inputs_embeds
         bsz, seq_len, dim = embeds.shape
@@ -697,10 +700,22 @@ class LlavaMetaForCausalLM(ABC):
             # of over-focusing on one region. Reuses AgilePruner's greedy selector (Eq. 6).
             norm_hid = img_hid / (img_hid.norm(dim=-1, keepdim=True) + 1e-8)
             d_hid = 1.0 - (norm_hid @ norm_hid.t())                # (m, m) cosine distance
-            keep_local = select_diverse_tokens_by_attention_and_distance(
-                fused.unsqueeze(0), d_hid, effective_rank(img_hid).item(),
-                max_tokens=rank, static_tau=(qadp_tau if qadp_tau > 0 else None),
-            )
+            erank_llm = effective_rank(img_hid).item()
+            if qadp_adaptive == 1:
+                # AgilePruner-style per-token adaptive tau (Eq. 6) in the LLM space:
+                # tau_i = order_i * (erank / erank_ref * 0.01), capped at tau_max. The
+                # reference values are ViT-calibrated; expose them so they can be retuned
+                # for the LLM space without touching code.
+                keep_local = select_diverse_tokens_by_attention_and_distance(
+                    fused.unsqueeze(0), d_hid, erank_llm,
+                    max_tokens=rank, static_tau=None,
+                    erank_avg=qadp_erank_ref, tau_max=qadp_tau_max,
+                )
+            else:
+                keep_local = select_diverse_tokens_by_attention_and_distance(
+                    fused.unsqueeze(0), d_hid, erank_llm,
+                    max_tokens=rank, static_tau=(qadp_tau if qadp_tau > 0 else None),
+                )
         elif sv_av_mode == 2:
             keep_local = av_order[:rank]
         elif sv_av_mode == 1:
