@@ -6,13 +6,13 @@ IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
 
 CKPT="llava-v1.5-7b"
-METHOD="agilepruner"
+METHOD="${METHOD:-regionvtp}"
 TOKEN=${1}
 PARAM="n_${TOKEN}"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -W ignore -m llava.eval.model_vqa_loader \
-        --model-path liuhaotian/${CKPT} \
+        --model-path /groups/g900403/home/share/phr/models/liuhaotian/llava-v1.5-7b \
         --question-file ./playground/data/eval/gqa/llava_gqa_testdev_balanced.jsonl \
         --image-folder ./playground/data/eval/gqa/images \
         --answers-file ./playground/data/eval/gqa/answers/${CKPT}/${METHOD}/${PARAM}/${CHUNKS}_${IDX}.jsonl \

@@ -1,12 +1,12 @@
 #!/bin/bash
 
 CKPT="llava-v1.5-7b"
-METHOD="agilepruner"
+METHOD="${METHOD:-regionvtp}"
 TOKEN=${1}
 PARAM="n_${TOKEN}"
 
 python -W ignore -m llava.eval.model_vqa_loader \
-    --model-path liuhaotian/${CKPT} \
+    --model-path /groups/g900403/home/share/phr/models/liuhaotian/llava-v1.5-7b \
     --question-file ./playground/data/eval/pope/llava_pope_test.jsonl \
     --image-folder ./playground/data/eval/pope/val2014 \
     --answers-file ./playground/data/eval/pope/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
