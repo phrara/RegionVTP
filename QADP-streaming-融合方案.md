@@ -80,19 +80,26 @@ Cacher 只在「同一视觉塔连续处理多帧」时才有收益——单图�
   2. 子类包装 `LlavaOnevisionForConditionalGeneration`，走 `generate` 前置剪枝（镜像 LLaVA-1.5 `llava_llama.py:112-152`），**不 override `forward`**；
   3. 独立环境（transformers==4.49.0）+ 单图入口脚本。
 - **验收**：基线 sanity → 透明钩子（`TCARVE_RANK=196` 与不剪逐 token 一致）→ 真实剪枝（`TCARVE_RANK=64` 不崩、log 正确）。
-- **关键坑（已记录到 memory）**：`llava/model/__init__.py` 在 4.40+ 崩（MPT 已删）；Qwen2 层直接调要传 `position_embeddings`；单图 = 196 视觉 + 1 `image_newline` = 197 token。
+- **关键坑（已记录到 memory）**：`llava/model/__init__.py` 在 4.40+ 崩（MPT 已删）；Qwen2 层直接调要传 `position_embeddings`；**anyres 视觉 token 是动态的**（大幅图多 crop，本测试图 4724 视觉 + 24 newline，不是 196/197）；`generate(inputs_embeds=...)` 会退化重复，改用**手动 prefill+decode 循环**，且 decode 的 `input_ids` 要 2D `(1,1)`（`next_token.reshape(1,1)`，不是 `.unsqueeze(0)`）。
 
 ### M1 — 视频底座 + 不压缩基线 + 接入 STC-Cacher（核心交付）
 
 - **目标**：跑通 OVO-Bench / StreamingBench，拿到「不压缩基线」，再把 Cacher 挂上测出帧间复用收益。
-- **改动**：
-  1. 装 ReKV 视频链路（LLaVA-OneVision-7B）+ 下载视频数据 + 跑通 eval 脚本；
-  2. 在**视频模型自己的入口**里、以 `STC_PATCH_VISION=1` 门控地调用 `register_stc_cacher(vision_tower, kind="siglip")`——**不进共享 builder**，不碰 LLaVA-1.5 加载路径；
-  3. 按多帧流式跑，用 `enable_streaming_cacher()` / `reset_streaming_cacher()` 逐视频推进缓存；
-  4. 扫 `update_token_ratio` / `cache_interval` / `share_selection`，找「延迟 vs 精度」最优点。
+- **改动（M1 第一步已落地，代码在 `llava/onevision/`）**：
+  1. `llava/onevision/llava_onevision_video.py`：视频包装器 `load_onevision_video()`（门控 `register_stc_cacher(vision_tower, kind="siglip")`，仅 `STC_PATCH_VISION=1` 生效）+ `encode_video_per_frame()`（**逐帧 B=1 驱动 SigLIP 塔**、帧间 `reset_default_cache(chunk_idx)` 推进缓存——标准 `get_video_features` 是整批一次过塔，cacher 看到只有一个 chunk、永远全量重算，所以必须逐帧）；
+  2. `scripts/onevision/bench_video_latency.py`：合成视频（时序冗余噪声漂移）的 ViT 编码延迟 benchmark，基线 vs +STC，直接看 ViT 那行 ↓≈24.5%；
+  3. 其余（视频数据下载、真实 eval、扫参）接在延迟验收通过之后。
+- **入口命令（两条，两进程对比 ViT encode 行）**：
+  ```bash
+  # 基线
+  python scripts/onevision/bench_video_latency.py --model-path $MODEL --num-frames 16
+  # +STC（必须显式设 STC_UPDATE_TOKEN_RATIO=0.25 才有收益，默认 1.0=全量重算）
+  STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
+    python scripts/onevision/bench_video_latency.py --model-path $MODEL --num-frames 16
+  ```
 - **验收**：
   - 不压缩基线准确率/延迟能复现（OVO 实时 64.4、ViT 编码 103.7 等）；
-  - ViT 编码延迟下降 ≈ 论文（↓24.5%）；
+  - **ViT 编码延迟下降 ≈ 论文（↓24.5%）**——这是 M1 第一步的硬验收，合成视频即可测，不用下数据；
   - 准确率损失可控（论文 −1.9 是 Cacher+Pruner 一起的结果，**单独 Cacher 的损失应更小**，这一步要测出来并记录）。
 
 ### M2（暂缓）— QADP 帧内替换 STC-Pruner
