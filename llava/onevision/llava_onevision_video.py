@@ -34,7 +34,7 @@ import torch
 
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
-from stc import default_config, register_stc_cacher, reset_default_cache, stc_patch_vision_enabled
+from stc import default_cache, default_config, register_stc_cacher, reset_default_cache, stc_patch_vision_enabled
 
 from llava.onevision.qadp_core import qadp_llm_prune_frames, read_qadp_env
 
@@ -116,7 +116,10 @@ def encode_video_per_frame(model, pixel_values_videos, cfg=None):
         # Advance the cacher's chunk counter before each frame: chunk 0 does a full
         # reference encode, later frames reuse it selectively (only the changed
         # ``update_token_ratio`` fraction is recomputed).
-        reset_default_cache(f, cfg.cache.update_token_ratio)
+        # NOTE: use ``reset_for_chunk`` (bumps ``chunk_idx`` only), NOT
+        # ``reset_default_cache`` — the latter calls ``torch.cuda.empty_cache()``
+        # on every frame, a real per-frame overhead that would negate the cacher.
+        default_cache().reset_for_chunk(f, cfg.cache.update_token_ratio)
         frame = pixel_values_videos[:, f]  # (batch, C, H, W)
         out = model.vision_tower(frame, output_hidden_states=True)
         if isinstance(layer, int):
