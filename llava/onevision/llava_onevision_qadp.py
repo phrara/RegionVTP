@@ -119,7 +119,10 @@ class LlavaOnevisionQADP(LlavaOnevisionForConditionalGeneration):
                 inputs_embeds, attention_mask, position_ids = new_embeds, new_mask, new_pos
 
             # Pruned (or, if image_length==0, full) embeds -> standard generate, no pixel inputs.
-            self._qadp_input_len = int(inputs_embeds.shape[1])
+            # NOTE: with `inputs_embeds` (and no `input_ids`), generate() returns ONLY the
+            # generated tokens — the prompt has no token ids to prepend. So the caller must
+            # decode the whole output (prompt offset = 0), unlike the input_ids baseline path.
+            self._qadp_input_len = 0
             return super().generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
