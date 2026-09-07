@@ -119,6 +119,7 @@ class LlavaOnevisionQADP(LlavaOnevisionForConditionalGeneration):
                 inputs_embeds, attention_mask, position_ids = new_embeds, new_mask, new_pos
 
             # Pruned (or, if image_length==0, full) embeds -> standard generate, no pixel inputs.
+            self._qadp_input_len = int(inputs_embeds.shape[1])
             return super().generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -127,6 +128,7 @@ class LlavaOnevisionQADP(LlavaOnevisionForConditionalGeneration):
             )
 
         # Baseline: delegate unchanged.
+        self._qadp_input_len = int(input_ids.shape[1]) if input_ids is not None else None
         return super().generate(
             input_ids=input_ids,
             pixel_values=pixel_values,

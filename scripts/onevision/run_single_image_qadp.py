@@ -85,8 +85,11 @@ def main():
     with torch.no_grad():
         output = model.generate(**gen_kwargs)
 
+    # 剪枝路径下序列被缩短，真实 prompt 长度由 wrapper 记录在 _qadp_input_len；
+    # 基线路径无此属性，回退到原始 input_len。
+    prompt_len = getattr(model, "_qadp_input_len", input_len)
     answer = processor.decode(
-        output[0, input_len:], skip_special_tokens=True
+        output[0, prompt_len:], skip_special_tokens=True
     ).strip()
 
     print("=" * 60)

@@ -85,7 +85,8 @@ def main():
 
         with torch.no_grad():
             output = model.generate(**gen_kwargs)
-        pred = processor.decode(output[0, input_len:], skip_special_tokens=True).strip()
+        prompt_len = getattr(model, "_qadp_input_len", input_len)
+        pred = processor.decode(output[0, prompt_len:], skip_special_tokens=True).strip()
 
         gt = row["answer"].strip()
         ok = pred.lower() == gt.lower()

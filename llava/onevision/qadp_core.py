@@ -177,6 +177,13 @@ def qadp_llm_prune(
     if position_ids is None:
         position_ids = torch.arange(seq_len, device=dev, dtype=torch.long).unsqueeze(0)
 
+    # Transparent no-op: caller asked to keep >= all image tokens and merge nothing. Return
+    # the inputs unchanged so the generate-override path can be diffed bit-identically against
+    # the no-prune baseline (isolates embeds / attention_mask / position reconstruction bugs).
+    if cfg.rank >= image_length and cfg.merge_nums == 0:
+        keep_global = torch.arange(seq_len, device=dev, dtype=torch.long)
+        return embeds, attention_mask, position_ids, keep_global, int(image_length)
+
     # 4D causal mask for the partial (prefill) forward over the full sequence.
     causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
     causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
