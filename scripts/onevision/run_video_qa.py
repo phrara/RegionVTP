@@ -109,15 +109,23 @@ def main() -> int:
     print("-" * 66)
 
     t0 = time.perf_counter()
+    timing: dict = {}
     answer = run_video_qa(model, processor, frames, args.prompt,
-                          max_new_tokens=args.max_new_tokens, cfg=cfg)
+                          max_new_tokens=args.max_new_tokens, cfg=cfg, timing=timing)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
 
     print(f" answer   | {answer}")
-    print(f" wall     | {wall:.2f} s  (ViT encode + LLM prefill/decode)")
+    print("-" * 66)
+    n_gen = timing.get("n_generated", args.max_new_tokens)
+    print(f" ViT      | {timing.get('vit_ms', float('nan')):8.1f} ms  (per-frame SigLIP, cacher's effect)")
+    if qadp_on:
+        print(f" QADP     | {timing.get('qadp_ms', float('nan')):8.1f} ms  (partial forward + per-frame select/merge)")
+    print(f" prefill  | {timing.get('prefill_ms', float('nan')):8.1f} ms  (LLM, QADP shortens the visual seq)")
+    print(f" decode   | {timing.get('decode_ms', float('nan')):8.1f} ms  ({n_gen} tok, output-length-dependent)")
+    print(f" wall     | {wall:8.2f} s")
     print("=" * 66)
-    print(" Compare this against the STC_PATCH_VISION=0 run to see the cacher's effect.")
+    print(" Compare against STC_PATCH_VISION=0 / LLM_LAYER_PRUNE=0 runs for the cacher / QADP effect.")
     return 0
 
 

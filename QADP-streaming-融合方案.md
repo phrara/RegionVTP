@@ -103,26 +103,39 @@ Cacher 只在「同一视觉塔连续处理多帧」时才有收益——单图�
 
 - **入口命令 B（融合 pipeline 端到端问答，四个开关组合）**：
   ```bash
-  M="--model-path /path/to/llava-onevision-qwen2-7b-ov-hf"
-  V="--video /path/to/clip.mp4"                # 或 --image-dir 目录 / 省略走合成帧
-  P='--prompt "What is happening in this video?"'
+  M="--model-path /groups/g900403/home/share/phr/models/llava-onevision-qwen2-7b-ov-hf/"
+  V="--video ../test3.mp4"                # 或 --image-dir 目录 / 省略走合成帧
+  # ⚠️ prompt 带空格，必须内联双引号，别放进变量（$P 展开时引号不重解析，会被空格拆散）
 
   # ① 基线（纯 OneVision）
-  python scripts/onevision/run_video_qa.py $M $V $P
+  python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
 
   # ② 只 cacher（帧间复用）
   STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
-    python scripts/onevision/run_video_qa.py $M $V $P
+    python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
 
   # ③ 只 QADP（帧内逐帧剪枝，TCARVE_RANK=每帧保留 token 数）
   LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
-    python scripts/onevision/run_video_qa.py $M $V $P
+    python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
 
   # ④ 融合（帧间 cacher + 帧内逐帧 QADP）
   STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
     LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
-    python scripts/onevision/run_video_qa.py $M $V $P
+    python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
   ```
+
+  每个命令现在会打印**分阶段耗时**（CUDA event，ms），四个组合各跑一次即可对照每一档的边际贡献：
+
+  | 阶段 | 看什么 |
+  |---|---|
+  | `ViT` | 逐帧 SigLIP 编码 —— **cacher 的收益点**（②/④ 应比 ①/③ ↓20-22%） |
+  | `QADP` | partial forward + 逐帧 select/merge —— QADP 的**额外开销**（仅 ③/④ 出现） |
+  | `prefill` | LLM prefill —— **QADP 的收益点**（③/④ 因 seq 3152→528 应明显变短） |
+  | `decode` | LLM 逐 token decode —— 与输出长度挂钩，**与开关无关**，是 wall 的主导项 |
+  | `wall` | 总墙钟（之前 1.59 / 1.55 / 1.49 / 1.80，decode 淹没了 ViT/prefill 的节省） |
+
+  > 之前的 wall 对比看不出效果，就是因为 decode 占大头；分阶段后单独看 `ViT` 行（cacher）和 `prefill` 行（QADP）才不被 decode 长度干扰。
+
 - **验收**：
   - 不压缩基线准确率/延迟能复现（OVO 实时 64.4、ViT 编码 103.7 等）；
   - **ViT 编码延迟下降 ≈ 论文（↓24.5%）**——这是 M1 第一步的硬验收，合成视频即可测，不用下数据；

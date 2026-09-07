@@ -27,6 +27,7 @@ Opt-in / non-invasive (same contract as the LLaVA-1.5 CLIP adapter in
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -40,6 +41,24 @@ from llava.onevision.qadp_core import qadp_llm_prune_frames, read_qadp_env
 
 def _qadp_enabled() -> bool:
     return os.environ.get("LLM_LAYER_PRUNE", "0") == "1"
+
+
+@contextlib.contextmanager
+def _timed(timing, name):
+    """Time the enclosed GPU work (CUDA events) into ``timing[name]`` (ms).
+
+    No-op when ``timing`` is None, so call sites can wrap unconditionally.
+    """
+    if timing is None:
+        yield
+        return
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    yield
+    end.record()
+    torch.cuda.synchronize()
+    timing[name] = start.elapsed_time(end)
 
 
 def load_onevision_video(model_path: str, device: str = "cuda"):
@@ -136,11 +155,13 @@ def merge_video_features(model, input_ids, inputs_embeds, video_features):
 
 
 @torch.no_grad()
-def autoregressive_generate(model, inputs_embeds, max_new_tokens=128):
+def autoregressive_generate(model, inputs_embeds, max_new_tokens=128, timing=None):
     """Greedy prefill + decode loop over ``model.language_model`` (mirrors M0's
     ``_autoregressive_generate``).  LLaVA-OneVision's ``generate(inputs_embeds=...)`` path
     degenerates into repetition, so we drive the language model directly and return only the
     generated token ids (no prompt prefix).
+
+    If ``timing`` is a dict, fills ``prefill_ms`` and ``decode_ms`` (CUDA-event elapsed).
     """
     eos = model.generation_config.eos_token_id or model.config.eos_token_id
     if isinstance(eos, (list, tuple)):
@@ -151,20 +172,22 @@ def autoregressive_generate(model, inputs_embeds, max_new_tokens=128):
         eos_set = set()
 
     device = inputs_embeds.device
-    out = model.language_model(inputs_embeds=inputs_embeds, use_cache=True)
+    with _timed(timing, "prefill_ms"):
+        out = model.language_model(inputs_embeds=inputs_embeds, use_cache=True)
     past_key_values = out.past_key_values
     next_token = out.logits[0, -1].argmax(dim=-1)
 
     generated = [int(next_token.item())]
-    for _ in range(max_new_tokens - 1):
-        if generated[-1] in eos_set:
-            break
-        out = model.language_model(
-            input_ids=next_token.reshape(1, 1), use_cache=True, past_key_values=past_key_values
-        )
-        past_key_values = out.past_key_values
-        next_token = out.logits[0, -1].argmax(dim=-1)
-        generated.append(int(next_token.item()))
+    with _timed(timing, "decode_ms"):
+        for _ in range(max_new_tokens - 1):
+            if generated[-1] in eos_set:
+                break
+            out = model.language_model(
+                input_ids=next_token.reshape(1, 1), use_cache=True, past_key_values=past_key_values
+            )
+            past_key_values = out.past_key_values
+            next_token = out.logits[0, -1].argmax(dim=-1)
+            generated.append(int(next_token.item()))
 
     return torch.tensor([generated], device=device, dtype=torch.long)
 
@@ -208,13 +231,17 @@ def prune_video_tokens(model, input_ids, inputs_embeds, frame_len, num_frames):
 
 
 @torch.no_grad()
-def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None):
+def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None, timing=None):
     """Full end-to-end video QA: ``frames`` + ``prompt`` -> generated answer text.
 
     ``frames`` is anything the processor's video pipeline accepts (a uint8 array
     ``(N, H, W, 3)``, a list of PIL images, or a video path).  The SigLIP tower is driven
     per frame (B=1) by :func:`encode_video_per_frame`, so STC-Cacher is exercised when
     ``STC_PATCH_VISION=1``; with the flag off this is the pure OneVision video baseline.
+
+    If ``timing`` is a dict, fills per-stage GPU ms: ``vit_ms`` (cacher's effect),
+    ``qadp_ms`` (partial forward + select, when QADP on), ``prefill_ms`` / ``decode_ms``
+    (QADP's prefill saving vs. decode length), and ``n_generated``.
     """
     cfg = cfg if cfg is not None else default_config()
 
@@ -227,7 +254,8 @@ def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None)
     input_ids = inputs["input_ids"].to(model.device)
     pixel_values_videos = inputs["pixel_values_videos"].to(model.device, model.dtype)
 
-    video_features = encode_video_per_frame(model, pixel_values_videos, cfg=cfg)
+    with _timed(timing, "vit_ms"):
+        video_features = encode_video_per_frame(model, pixel_values_videos, cfg=cfg)
     num_frames = pixel_values_videos.shape[1]
     frame_len = video_features.shape[1] // num_frames  # pooled tokens per frame
 
@@ -235,7 +263,10 @@ def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None)
     inputs_embeds = merge_video_features(model, input_ids, inputs_embeds, video_features)
 
     if _qadp_enabled():
-        inputs_embeds, _ = prune_video_tokens(model, input_ids, inputs_embeds, frame_len, num_frames)
+        with _timed(timing, "qadp_ms"):
+            inputs_embeds, n_kept = prune_video_tokens(model, input_ids, inputs_embeds, frame_len, num_frames)
 
-    out_ids = autoregressive_generate(model, inputs_embeds, max_new_tokens=max_new_tokens)
+    out_ids = autoregressive_generate(model, inputs_embeds, max_new_tokens=max_new_tokens, timing=timing)
+    if timing is not None:
+        timing["n_generated"] = int(out_ids.shape[1])
     return processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
