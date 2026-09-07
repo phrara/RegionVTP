@@ -234,7 +234,7 @@ def prune_video_tokens(model, input_ids, inputs_embeds, frame_len, num_frames):
 
 
 @torch.no_grad()
-def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None, timing=None):
+def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None, timing=None, warmup=0):
     """Full end-to-end video QA: ``frames`` + ``prompt`` -> generated answer text.
 
     ``frames`` is anything the processor's video pipeline accepts (a uint8 array
@@ -245,6 +245,12 @@ def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None,
     If ``timing`` is a dict, fills per-stage GPU ms: ``vit_ms`` (cacher's effect),
     ``qadp_ms`` (partial forward + select, when QADP on), ``prefill_ms`` / ``decode_ms``
     (QADP's prefill saving vs. decode length), and ``n_generated``.
+
+    ``warmup`` runs the ViT encode that many times *before* the timed region.  The
+    cacher's one-time CUDA-graph capture (~140ms: 3 side-stream warmup + 1 capture, see
+    ``stc.cacher.graph``) is keyed on the per-frame shape, so a single warmup call
+    captures the graph and every later frame replays it — this is how to simulate
+    steady-state streaming on a short clip.
     """
     cfg = cfg if cfg is not None else default_config()
 
@@ -256,6 +262,9 @@ def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None,
 
     input_ids = inputs["input_ids"].to(model.device)
     pixel_values_videos = inputs["pixel_values_videos"].to(model.device, model.dtype)
+
+    for _ in range(warmup):
+        encode_video_per_frame(model, pixel_values_videos, cfg=cfg)
 
     with _timed(timing, "vit_ms"):
         video_features = encode_video_per_frame(model, pixel_values_videos, cfg=cfg)

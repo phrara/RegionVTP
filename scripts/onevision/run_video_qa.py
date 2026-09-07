@@ -90,6 +90,8 @@ def main() -> int:
     parser.add_argument("--image-size", type=int, default=384, help="synthetic-frame resolution")
     parser.add_argument("--sample-fps", type=float, default=0.5, help="mp4 frame subsampling")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="ViT-encode warmup iters before timing (pays the cacher's one-time CUDA-graph capture)")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -113,7 +115,8 @@ def main() -> int:
     t0 = time.perf_counter()
     timing: dict = {}
     answer = run_video_qa(model, processor, frames, args.prompt,
-                          max_new_tokens=args.max_new_tokens, cfg=cfg, timing=timing)
+                          max_new_tokens=args.max_new_tokens, cfg=cfg, timing=timing,
+                          warmup=args.warmup)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
 
