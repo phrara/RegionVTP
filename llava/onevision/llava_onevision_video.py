@@ -98,3 +98,85 @@ def encode_video_per_frame(model, pixel_values_videos, cfg=None):
     video_features = model.apply_pooling(video_features)
     video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)
     return video_features
+
+
+@torch.no_grad()
+def merge_video_features(model, input_ids, inputs_embeds, video_features):
+    """Scatter ``video_features`` into ``inputs_embeds`` at the ``<video>`` token positions.
+
+    Mirrors the video branch of ``LlavaOnevisionModel.forward`` (transformers >= 4.45):
+    the pooled per-frame features ``(batch, frames * N, D)`` get **one** trailing
+    ``image_newline`` appended (``+1`` token total, not one per frame), then are scattered
+    over the ``video_token_index`` slots of the prompt (which the processor has expanded to
+    exactly ``frames * N + 1`` tokens).
+    """
+    newline = model.image_newline[None, None, :].repeat(video_features.shape[0], 1, 1)
+    newline = newline.to(video_features.device)
+    video_features = torch.cat((video_features, newline), dim=1).flatten(0, 1)
+    video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+    video_mask = (input_ids == model.config.video_token_index).unsqueeze(-1)
+    video_mask = video_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+    return inputs_embeds.masked_scatter(video_mask, video_features)
+
+
+@torch.no_grad()
+def autoregressive_generate(model, inputs_embeds, max_new_tokens=128):
+    """Greedy prefill + decode loop over ``model.language_model`` (mirrors M0's
+    ``_autoregressive_generate``).  LLaVA-OneVision's ``generate(inputs_embeds=...)`` path
+    degenerates into repetition, so we drive the language model directly and return only the
+    generated token ids (no prompt prefix).
+    """
+    eos = model.generation_config.eos_token_id or model.config.eos_token_id
+    if isinstance(eos, (list, tuple)):
+        eos_set = set(int(e) for e in eos)
+    elif eos is not None:
+        eos_set = {int(eos)}
+    else:
+        eos_set = set()
+
+    device = inputs_embeds.device
+    out = model.language_model(inputs_embeds=inputs_embeds, use_cache=True)
+    past_key_values = out.past_key_values
+    next_token = out.logits[0, -1].argmax(dim=-1)
+
+    generated = [int(next_token.item())]
+    for _ in range(max_new_tokens - 1):
+        if generated[-1] in eos_set:
+            break
+        out = model.language_model(
+            input_ids=next_token.reshape(1, 1), use_cache=True, past_key_values=past_key_values
+        )
+        past_key_values = out.past_key_values
+        next_token = out.logits[0, -1].argmax(dim=-1)
+        generated.append(int(next_token.item()))
+
+    return torch.tensor([generated], device=device, dtype=torch.long)
+
+
+@torch.no_grad()
+def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None):
+    """Full end-to-end video QA: ``frames`` + ``prompt`` -> generated answer text.
+
+    ``frames`` is anything the processor's video pipeline accepts (a uint8 array
+    ``(N, H, W, 3)``, a list of PIL images, or a video path).  The SigLIP tower is driven
+    per frame (B=1) by :func:`encode_video_per_frame`, so STC-Cacher is exercised when
+    ``STC_PATCH_VISION=1``; with the flag off this is the pure OneVision video baseline.
+    """
+    cfg = cfg if cfg is not None else default_config()
+
+    conversation = [
+        {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": prompt}]}
+    ]
+    text = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    inputs = processor(text=text, videos=frames, return_tensors="pt")
+
+    input_ids = inputs["input_ids"].to(model.device)
+    pixel_values_videos = inputs["pixel_values_videos"].to(model.device, model.dtype)
+
+    video_features = encode_video_per_frame(model, pixel_values_videos, cfg=cfg)
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+    inputs_embeds = merge_video_features(model, input_ids, inputs_embeds, video_features)
+
+    out_ids = autoregressive_generate(model, inputs_embeds, max_new_tokens=max_new_tokens)
+    return processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
