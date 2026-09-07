@@ -1,0 +1,15 @@
+# LLaVA-OneVision + QADP 独立环境依赖（与 LLaVA-1.5 的 pyproject.toml 完全隔离）。
+#
+# 为什么独立：LLaVA-1.5 锁死在 transformers==4.37.2（4 个 bench 锚点都在这上面跑）；
+# LLaVA-OneVision(-hf) 需要 transformers>=4.45（Qwen2 4.40+、LlavaOnevision 类 4.45+）。
+# 本环境的代码全部放在 temp/RegionVTP，但运行时用这里 pin 的版本，绝不升级 LLaVA-1.5 环境。
+#
+# 代码按 transformers 4.49.0 验证（`_merge_input_ids_with_image_features` 已被内联进
+# `forward`；wrapper 走 `generate` 前置剪枝，用的是稳定公开 API）。若换其他 4.45+ 版本，
+# 先核对 `get_image_features` / `pack_image_features` 的签名（`vision_aspect_ratio` 参数）。
+
+transformers==4.49.0
+torch>=2.1
+accelerate>=0.25
+Pillow
+numpy

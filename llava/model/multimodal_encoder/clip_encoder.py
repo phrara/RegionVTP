@@ -30,6 +30,11 @@ class CLIPVisionTower(nn.Module):
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
         self.vision_tower.requires_grad_(False)
 
+        # [STC-Cacher] opt-in 帧间选择性重算接入（默认关，STC_PATCH_VISION=1 才生效）。
+        # 单图 LLaVA-1.5 下走全量直通；真正的帧间加速需多帧视频底座（见 STC-Cacher-融合说明.md）。
+        from llava.model.multimodal_encoder.stc_cacher_adapter import maybe_register_stc_cacher
+        maybe_register_stc_cacher(self.vision_tower)
+
         self.is_loaded = True
 
     # [FasterVLM] Select image features and attentions
