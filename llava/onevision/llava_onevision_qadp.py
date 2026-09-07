@@ -84,7 +84,7 @@ class LlavaOnevisionQADP(LlavaOnevisionForConditionalGeneration):
             if generated[-1] in eos_set:
                 break
             out = self.language_model(
-                input_ids=next_token.unsqueeze(0), use_cache=True, past_key_values=past_key_values
+                input_ids=next_token.reshape(1, 1), use_cache=True, past_key_values=past_key_values
             )
             past_key_values = out.past_key_values
             next_token = out.logits[0, -1].argmax(dim=-1)
