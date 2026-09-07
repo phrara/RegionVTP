@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import os
 import sys
 import time
@@ -79,6 +80,7 @@ def load_frames(args) -> tuple[np.ndarray, str]:
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO)  # 让 STC-Cacher 的 CUDA-graph 捕获日志可见
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--video", default=None, help="real mp4 (needs decord)")
