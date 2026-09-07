@@ -1,19 +1,30 @@
-"""End-to-end video QA for LLaVA-OneVision, with opt-in STC-Cacher.
+"""End-to-end video QA for LLaVA-OneVision, with opt-in STC-Cacher + QADP.
 
-This is the M1 "complete pipeline" entry point: a video (real mp4 / folder of frame
+This is the fused streaming-pipeline entry point: a video (real mp4 / folder of frame
 images / synthetic) + a text prompt -> generated answer.  It exercises the whole path
-``video -> per-frame SigLIP (cacher-aware) -> projector -> pooling -> LLM prefill+decode``
-so you can eyeball the effect on a single local clip.
+``video -> per-frame SigLIP (cacher-aware) -> projector -> pooling -> merge -> QADP prune
+(opt-in) -> LLM prefill+decode``.  Two independent knobs, both default off:
+
+* ``STC_PATCH_VISION=1`` — frame-to-frame ViT reuse (STC-Cacher).
+* ``LLM_LAYER_PRUNE=1`` — intra-frame token pruning (QADP); budget via ``TCARVE_RANK`` /
+  ``TCARVE_MERGE`` (set explicitly, defaults are a near no-op).
 
 Run from the repo root (so ``llava`` and ``stc`` are importable)::
 
-    # baseline (pure OneVision, no cacher)
+    # baseline (pure OneVision)
     python scripts/onevision/run_video_qa.py \\
         --model-path /path/to/llava-onevision-qwen2-7b-ov-hf \\
         --video /path/to/clip.mp4 --prompt "What is happening in this video?"
 
     # +STC-Cacher (frame-to-frame ViT reuse)
     STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \\
+        python scripts/onevision/run_video_qa.py \\
+        --model-path /path/to/llava-onevision-qwen2-7b-ov-hf \\
+        --video /path/to/clip.mp4 --prompt "What is happening in this video?"
+
+    # fused: Cacher + QADP (frame-to-frame reuse AND intra-frame prune)
+    STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \\
+        LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \\
         python scripts/onevision/run_video_qa.py \\
         --model-path /path/to/llava-onevision-qwen2-7b-ov-hf \\
         --video /path/to/clip.mp4 --prompt "What is happening in this video?"
@@ -88,9 +99,11 @@ def main() -> int:
     cfg = default_config()
     frames, desc = load_frames(args)
 
+    qadp_on = os.environ.get("LLM_LAYER_PRUNE", "0") == "1"
     print("=" * 66)
-    print(f" pipeline | patch_vision={stc_patch_vision_enabled()} "
-          f"update_ratio={cfg.cache.update_token_ratio} interval={cfg.cache.cache_interval}")
+    print(f" pipeline | cacher={stc_patch_vision_enabled()} "
+          f"(update_ratio={cfg.cache.update_token_ratio} interval={cfg.cache.cache_interval}) "
+          f"qadp={qadp_on}")
     print(f" video    | {desc}")
     print(f" prompt   | {args.prompt}")
     print("-" * 66)

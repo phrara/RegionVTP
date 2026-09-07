@@ -14,7 +14,8 @@
   - `llava_onevision_qadp.py`（`LlavaOnevisionQADP` 包装类，走 `generate` 前置剪枝）
   - 入口 `scripts/onevision/run_single_image_qadp.py` / `eval_vqa_qadp.py`；依赖 `requirements/onevision.txt`
 - ✅ **独立环境**：transformers==4.49.0（LLaVA-1.5 的 4.37.2 环境一字不动，4 个 bench 锚点零风险）。
-- ⏳ **待做**：视频底座 + 不压缩基线 + STC-Cacher 接入（下一里程碑 M1）。
+- ✅ **融合 pipeline 已搭好**（M1）：`scripts/onevision/run_video_qa.py` 端到端 `视频 → 逐帧 SigLIP(cacher) → merge → QADP 逐帧剪枝(可选) → LLM prefill+decode`，两个开关 `STC_PATCH_VISION`（帧间 cacher）/ `LLM_LAYER_PRUNE`（帧内 QADP）独立、可叠加。延迟侧已用合成视频验过 ViT ↓20-22%（逼近论文 24.5%）。
+- ⏳ **待做**：真实视频数据 + 不压缩基线精度 + 扫参消融（`update_token_ratio` / `cache_interval` / `TCARVE_RANK`）。
 
 ---
 
@@ -85,17 +86,42 @@ Cacher 只在「同一视觉塔连续处理多帧」时才有收益——单图�
 ### M1 — 视频底座 + 不压缩基线 + 接入 STC-Cacher（核心交付）
 
 - **目标**：跑通 OVO-Bench / StreamingBench，拿到「不压缩基线」，再把 Cacher 挂上测出帧间复用收益。
-- **改动（M1 第一步已落地，代码在 `llava/onevision/`）**：
+- **改动（M1 已落地，代码在 `llava/onevision/`）**：
   1. `llava/onevision/llava_onevision_video.py`：视频包装器 `load_onevision_video()`（门控 `register_stc_cacher(vision_tower, kind="siglip")`，仅 `STC_PATCH_VISION=1` 生效）+ `encode_video_per_frame()`（**逐帧 B=1 驱动 SigLIP 塔**、帧间 `reset_default_cache(chunk_idx)` 推进缓存——标准 `get_video_features` 是整批一次过塔，cacher 看到只有一个 chunk、永远全量重算，所以必须逐帧）；
   2. `scripts/onevision/bench_video_latency.py`：合成视频（时序冗余噪声漂移）的 ViT 编码延迟 benchmark，基线 vs +STC，直接看 ViT 那行 ↓≈24.5%；
-  3. 其余（视频数据下载、真实 eval、扫参）接在延迟验收通过之后。
-- **入口命令（两条，两进程对比 ViT encode 行）**：
+  3. **融合 pipeline**（端到端问答）：`merge_video_features`（视频 merge 进 embeds）+ `autoregressive_generate`（手动 prefill+decode）+ `run_video_qa`，加上 `qadp_core.qadp_llm_prune_frames`（**逐帧** QADP：partial forward 只跑一次、按帧各自选+merge，`TCARVE_RANK`=每帧保留 token 数）→ `scripts/onevision/run_video_qa.py`；
+  4. 其余（视频数据下载、真实 eval、扫参）接在延迟验收通过之后。
+
+- **入口命令 A（延迟 benchmark，两进程对比 ViT encode 行）**：
   ```bash
   # 基线
   python scripts/onevision/bench_video_latency.py --model-path $MODEL --num-frames 16
   # +STC（必须显式设 STC_UPDATE_TOKEN_RATIO=0.25 才有收益，默认 1.0=全量重算）
   STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
     python scripts/onevision/bench_video_latency.py --model-path $MODEL --num-frames 16
+  ```
+
+- **入口命令 B（融合 pipeline 端到端问答，四个开关组合）**：
+  ```bash
+  M="--model-path /path/to/llava-onevision-qwen2-7b-ov-hf"
+  V="--video /path/to/clip.mp4"                # 或 --image-dir 目录 / 省略走合成帧
+  P='--prompt "What is happening in this video?"'
+
+  # ① 基线（纯 OneVision）
+  python scripts/onevision/run_video_qa.py $M $V $P
+
+  # ② 只 cacher（帧间复用）
+  STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
+    python scripts/onevision/run_video_qa.py $M $V $P
+
+  # ③ 只 QADP（帧内逐帧剪枝，TCARVE_RANK=每帧保留 token 数）
+  LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
+    python scripts/onevision/run_video_qa.py $M $V $P
+
+  # ④ 融合（帧间 cacher + 帧内逐帧 QADP）
+  STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
+    LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
+    python scripts/onevision/run_video_qa.py $M $V $P
   ```
 - **验收**：
   - 不压缩基线准确率/延迟能复现（OVO 实时 64.4、ViT 编码 103.7 等）；

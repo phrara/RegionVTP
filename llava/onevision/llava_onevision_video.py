@@ -1,11 +1,18 @@
-"""LLaVA-OneVision video wrapper with opt-in STC-Cacher (frame-to-frame ViT reuse).
+"""LLaVA-OneVision video wrapper: the fused STC-Cacher + QADP streaming pipeline.
 
-M1 (video base + STC-Cacher) — the video counterpart of ``llava_onevision_qadp.py``
-(M0, single-image QADP).  It adds the one thing the standard transformers
-``get_video_features`` cannot do: drive the SigLIP tower **one frame at a time**
-(B=1) so STC-Cacher can reuse stationary tokens across consecutive frames.  The
-standard path batches all frames into a single ``vision_tower`` call, which the
-cacher sees as one chunk and therefore always recomputes in full — no saving.
+Two independent opt-in knobs, default both off (== pure OneVision video baseline):
+
+* ``STC_PATCH_VISION=1`` — STC-Cacher (frame-TO-frame ViT reuse).  The one thing the
+  standard transformers ``get_video_features`` cannot do: drive the SigLIP tower **one
+  frame at a time** (B=1) so the cacher can reuse stationary tokens across consecutive
+  frames.  The standard path batches all frames into a single ``vision_tower`` call, which
+  the cacher sees as one chunk and therefore always recomputes in full — no saving.
+* ``LLM_LAYER_PRUNE=1`` — QADP (intra-frame token pruning) on the merged video-token
+  block, reusing the M0 ``qadp_core.qadp_llm_prune``.  Budget via ``TCARVE_RANK`` /
+  ``TCARVE_MERGE`` (must be set explicitly; defaults are a near no-op).
+
+The two compose: ``STC_PATCH_VISION=1 LLM_LAYER_PRUNE=1`` gives frame-to-frame reuse
+**and** per-frame pruning in one pass.
 
 Opt-in / non-invasive (same contract as the LLaVA-1.5 CLIP adapter in
 ``llava/model/multimodal_encoder/stc_cacher_adapter.py``):
@@ -20,11 +27,19 @@ Opt-in / non-invasive (same contract as the LLaVA-1.5 CLIP adapter in
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
 from stc import default_config, register_stc_cacher, reset_default_cache, stc_patch_vision_enabled
+
+from llava.onevision.qadp_core import qadp_llm_prune_frames, read_qadp_env
+
+
+def _qadp_enabled() -> bool:
+    return os.environ.get("LLM_LAYER_PRUNE", "0") == "1"
 
 
 def load_onevision_video(model_path: str, device: str = "cuda"):
@@ -155,6 +170,44 @@ def autoregressive_generate(model, inputs_embeds, max_new_tokens=128):
 
 
 @torch.no_grad()
+def prune_video_tokens(model, input_ids, inputs_embeds, frame_len, num_frames):
+    """QADP **per-frame** pruning on the video-token block (gated by ``LLM_LAYER_PRUNE=1``).
+
+    The ``<video>`` placeholder expands to ``num_frames * frame_len`` visual tokens plus one
+    trailing ``image_newline``.  Each frame is pruned independently to ``rank`` tokens (budget
+    is per-frame, matching STC-Pruner's ``token_per_frame``); the newline is a separator and
+    is never pruned (same convention as M0's image path).  ``frame_len`` is the pooled
+    per-frame token count (196 for SigLIP), ``num_frames`` the frame count.
+
+    Mirrors ``llava_onevision_qadp.py``'s M0 prune call (Qwen2 needs the precomputed RoPE
+    tuple).  Returns ``(pruned_embeds, n_kept)`` where ``n_kept`` is the total kept visual
+    tokens across all frames.
+    """
+    video_pos = (input_ids[0] == model.config.video_token_index).nonzero().flatten()
+    if video_pos.numel() == 0:
+        return inputs_embeds, int(inputs_embeds.shape[1])
+
+    sys_length = int(video_pos[0].item())
+    cfg = read_qadp_env(visual_token_num=frame_len)  # per-frame budget
+    position_ids = torch.arange(
+        inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long
+    ).unsqueeze(0)
+    # transformers >= 4.46 Qwen2 layers require the precomputed RoPE (cos, sin) tuple.
+    position_embeddings = model.language_model.model.rotary_emb(inputs_embeds, position_ids)
+
+    new_embeds, _mask, _pos, _keep, n_kept = qadp_llm_prune_frames(
+        inputs_embeds, None, position_ids, sys_length, frame_len, num_frames,
+        layers=model.language_model.model.layers, cfg=cfg,
+        position_embeddings=position_embeddings,
+    )
+    print(
+        f"[QADP] frames={num_frames} frame_len={frame_len} rank={cfg.rank} "
+        f"-> kept={n_kept} (seq {inputs_embeds.shape[1]} -> {new_embeds.shape[1]})"
+    )
+    return new_embeds, int(n_kept)
+
+
+@torch.no_grad()
 def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None):
     """Full end-to-end video QA: ``frames`` + ``prompt`` -> generated answer text.
 
@@ -175,8 +228,14 @@ def run_video_qa(model, processor, frames, prompt, max_new_tokens=128, cfg=None)
     pixel_values_videos = inputs["pixel_values_videos"].to(model.device, model.dtype)
 
     video_features = encode_video_per_frame(model, pixel_values_videos, cfg=cfg)
+    num_frames = pixel_values_videos.shape[1]
+    frame_len = video_features.shape[1] // num_frames  # pooled tokens per frame
+
     inputs_embeds = model.get_input_embeddings()(input_ids)
     inputs_embeds = merge_video_features(model, input_ids, inputs_embeds, video_features)
+
+    if _qadp_enabled():
+        inputs_embeds, _ = prune_video_tokens(model, input_ids, inputs_embeds, frame_len, num_frames)
 
     out_ids = autoregressive_generate(model, inputs_embeds, max_new_tokens=max_new_tokens)
     return processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()

@@ -143,6 +143,87 @@ def read_qadp_env(visual_token_num: int) -> QADPConfig:
     )
 
 
+def _rank_select_and_merge(attn_w, hid, embeds, block_start, block_len, rank, cfg):
+    """Select + prune-then-merge one contiguous block of visual tokens.
+
+    Faithful extraction of ``qadp_llm_prune``'s per-block logic (the AV/SV rank fusion and
+    the prune-then-merge fold), parameterised by ``block_start``/``block_len`` so it can be
+    reused for the single-image block (M0) and for **each frame** in the per-frame video
+    path.  ``rank`` must already be capped to ``[2, block_len]`` by the caller.
+
+    Returns ``(final_keep_local, n_kept, erank)`` where ``final_keep_local`` holds
+    block-relative indices (into ``[block_start, block_start + block_len)``).
+    """
+    dev = embeds.device
+    dtype = embeds.dtype
+    block_slice = slice(block_start, block_start + block_len)
+
+    # AV: last input token's (question) attention to each block token, mean over heads.
+    q2img = attn_w.mean(dim=1)[0, -1, block_slice]  # (block_len,)
+    _, av_order = torch.sort(q2img, descending=True)
+
+    # SV: SVD row contribution of the contextualized block tokens.
+    img_hid = hid[0, block_slice, :].to(torch.float32)  # (block_len, D)
+    U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
+    row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
+    _, sv_order = torch.sort(row_contrib, descending=True)
+
+    # rank fusion: positional weighting (TokenCarve AV/SV fusion).
+    m = block_len
+    idx_w = torch.arange(m, 0, -1, device=dev, dtype=torch.float32)
+    fused = torch.zeros(m, device=dev, dtype=torch.float32)
+    fused[av_order] += idx_w * cfg.sv_av_weight
+    fused[sv_order] += idx_w * (1.0 - cfg.sv_av_weight)
+    if cfg.qadp_diversity == 1:
+        # QADP: question-adaptive diversity coverage (select-only).
+        norm_hid = img_hid / (img_hid.norm(dim=-1, keepdim=True) + 1e-8)
+        d_hid = 1.0 - (norm_hid @ norm_hid.t())  # (m, m) cosine distance
+        erank_llm = effective_rank(img_hid).item()
+        if cfg.qadp_adaptive == 1:
+            keep_local = select_diverse_tokens_by_attention_and_distance(
+                fused.unsqueeze(0), d_hid, erank_llm,
+                max_tokens=rank, static_tau=None,
+                erank_avg=cfg.qadp_erank_ref, tau_max=cfg.qadp_tau_max,
+            )
+        else:
+            keep_local = select_diverse_tokens_by_attention_and_distance(
+                fused.unsqueeze(0), d_hid, erank_llm,
+                max_tokens=rank, static_tau=(cfg.qadp_tau if cfg.qadp_tau > 0 else None),
+            )
+    elif cfg.sv_av_mode == 2:
+        keep_local = av_order[:rank]
+    elif cfg.sv_av_mode == 1:
+        keep_local = sv_order[:rank]
+    else:
+        keep_local = torch.topk(fused, rank).indices
+    keep_local = keep_local.to(device=dev, dtype=torch.long)  # (rank,) local block indices
+
+    # prune-then-merge: fold the most-similar B (bottom half) into A (top half) via cosine.
+    set_length = rank // 2
+    A_local = keep_local[:set_length]
+    B_local = keep_local[set_length:]
+    img_emb = embeds[0, block_slice, :].float()  # (block_len, D)
+    norm = img_emb / (img_emb.norm(dim=-1, keepdim=True) + 1e-8)
+    sim = norm[B_local] @ norm[A_local].t()  # (rank - set_length, set_length)
+    sim_max, sim_arg = sim.max(dim=-1)
+    reduce_n = min(set_length, cfg.merge_nums)
+    order = torch.sort(sim_max, descending=True).indices
+    merge_B = B_local[order[:reduce_n]]
+    merge_A = A_local[sim_arg[order[:reduce_n]]]
+    remaining_B = B_local[order[reduce_n:]]
+
+    # merged embeddings: mean of each A and the B folded into it; order = A + remaining B.
+    merged = img_emb.clone()
+    counts = torch.ones(block_len, device=dev, dtype=torch.float32)
+    merged.index_add_(0, merge_A, img_emb[merge_B])
+    counts.index_add_(0, merge_A, torch.ones(reduce_n, device=dev, dtype=torch.float32))
+    merged = merged / counts.unsqueeze(-1)
+    final_keep_local = torch.cat([A_local, remaining_B])
+    final_img_emb = merged[final_keep_local].to(dtype)  # (T_final, D)
+
+    return final_keep_local, int(final_keep_local.numel()), effective_rank(final_img_emb).item()
+
+
 def qadp_llm_prune(
     inputs_embeds: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
@@ -203,70 +284,9 @@ def qadp_llm_prune(
         hid = out[0]
         attn_w = out[1]  # (B, heads, L, L)
 
-    img_slice = slice(sys_length, sys_length + image_length)
-
-    # AV: last input token's (question) attention to each image token, mean over heads.
-    q2img = attn_w.mean(dim=1)[0, -1, img_slice]  # (image_length,)
-    _, av_order = torch.sort(q2img, descending=True)
-
-    # SV: SVD row contribution of the contextualized image tokens.
-    img_hid = hid[0, img_slice, :].to(torch.float32)  # (image_length, D)
-    U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
-    row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (image_length,)
-    _, sv_order = torch.sort(row_contrib, descending=True)
-
-    # rank fusion: positional weighting (TokenCarve AV/SV fusion).
-    m = image_length
-    idx_w = torch.arange(m, 0, -1, device=dev, dtype=torch.float32)
-    fused = torch.zeros(m, device=dev, dtype=torch.float32)
-    fused[av_order] += idx_w * cfg.sv_av_weight
-    fused[sv_order] += idx_w * (1.0 - cfg.sv_av_weight)
-    if cfg.qadp_diversity == 1:
-        # QADP: question-adaptive diversity coverage (select-only).
-        norm_hid = img_hid / (img_hid.norm(dim=-1, keepdim=True) + 1e-8)
-        d_hid = 1.0 - (norm_hid @ norm_hid.t())  # (m, m) cosine distance
-        erank_llm = effective_rank(img_hid).item()
-        if cfg.qadp_adaptive == 1:
-            keep_local = select_diverse_tokens_by_attention_and_distance(
-                fused.unsqueeze(0), d_hid, erank_llm,
-                max_tokens=rank, static_tau=None,
-                erank_avg=cfg.qadp_erank_ref, tau_max=cfg.qadp_tau_max,
-            )
-        else:
-            keep_local = select_diverse_tokens_by_attention_and_distance(
-                fused.unsqueeze(0), d_hid, erank_llm,
-                max_tokens=rank, static_tau=(cfg.qadp_tau if cfg.qadp_tau > 0 else None),
-            )
-    elif cfg.sv_av_mode == 2:
-        keep_local = av_order[:rank]
-    elif cfg.sv_av_mode == 1:
-        keep_local = sv_order[:rank]
-    else:
-        keep_local = torch.topk(fused, rank).indices
-    keep_local = keep_local.to(device=dev, dtype=torch.long)  # (rank,) local image indices
-
-    # prune-then-merge: fold the most-similar B (bottom half) into A (top half) via cosine.
-    set_length = rank // 2
-    A_local = keep_local[:set_length]
-    B_local = keep_local[set_length:]
-    img_emb = embeds[0, img_slice, :].float()  # (image_length, D)
-    norm = img_emb / (img_emb.norm(dim=-1, keepdim=True) + 1e-8)
-    sim = norm[B_local] @ norm[A_local].t()  # (set_length, set_length)
-    sim_max, sim_arg = sim.max(dim=-1)
-    reduce_n = min(set_length, cfg.merge_nums)
-    order = torch.sort(sim_max, descending=True).indices
-    merge_B = B_local[order[:reduce_n]]
-    merge_A = A_local[sim_arg[order[:reduce_n]]]
-    remaining_B = B_local[order[reduce_n:]]
-
-    # merged image embeddings: mean of each A and the B folded into it; order = A + remaining B.
-    merged = img_emb.clone()
-    counts = torch.ones(image_length, device=dev, dtype=torch.float32)
-    merged.index_add_(0, merge_A, img_emb[merge_B])
-    counts.index_add_(0, merge_A, torch.ones(reduce_n, device=dev, dtype=torch.float32))
-    merged = merged / counts.unsqueeze(-1)
-    final_keep_local = torch.cat([A_local, remaining_B])
-    final_img_emb = merged[final_keep_local].to(dtype)  # (T_final, D)
+    final_keep_local, n_kept, er = _rank_select_and_merge(
+        attn_w, hid, embeds, sys_length, image_length, rank, cfg
+    )
 
     # global keep indices: prefix + kept image tokens + suffix.
     keep_global = torch.cat([
@@ -279,8 +299,89 @@ def qadp_llm_prune(
     new_pos = torch.arange(new_embeds.shape[1], device=dev, dtype=torch.long).unsqueeze(0)
 
     # report erank of the FINAL selection.
-    er = effective_rank(final_img_emb)
     if on_selected is not None:
-        on_selected(er.item())
+        on_selected(er)
 
-    return new_embeds, new_attn_mask, new_pos, keep_global, int(final_keep_local.numel())
+    return new_embeds, new_attn_mask, new_pos, keep_global, n_kept
+
+
+def qadp_llm_prune_frames(
+    inputs_embeds: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    position_ids: Optional[torch.Tensor],
+    sys_length: int,
+    frame_len: int,
+    num_frames: int,
+    layers,
+    cfg: QADPConfig,
+    on_selected: Optional[Callable[[float], None]] = None,
+    position_embeddings=None,
+):
+    """Per-frame QADP: prune each of ``num_frames`` contiguous ``frame_len``-token blocks.
+
+    The video block is ``[sys_length, sys_length + num_frames * frame_len)``; each frame is
+    pruned **independently** to ``rank`` tokens (``rank`` is capped to ``frame_len``), so the
+    budget is per-frame — matching STC-Pruner's ``token_per_frame``.  A single partial
+    forward over the full sequence produces the question-aware attention + contextualised
+    hidden states reused by every frame's AV/SV rank fusion (no per-frame re-forward).
+
+    Returns ``(new_embeds (1,L',D), new_attn_mask (1,L')|None, new_pos (1,L'),
+    keep_global (L',), final_video_count int)`` where ``final_video_count`` is the total
+    kept visual tokens across all frames.
+    """
+    embeds = inputs_embeds
+    bsz, seq_len, dim = embeds.shape
+    dev = embeds.device
+    dtype = embeds.dtype
+
+    rank = max(2, min(cfg.rank, frame_len))
+
+    if position_ids is None:
+        position_ids = torch.arange(seq_len, device=dev, dtype=torch.long).unsqueeze(0)
+
+    # Transparent no-op (same contract as qadp_llm_prune): rank covers the whole frame and
+    # nothing is merged -> return unchanged.
+    if cfg.rank >= frame_len and cfg.merge_nums == 0:
+        keep_global = torch.arange(seq_len, device=dev, dtype=torch.long)
+        return embeds, attention_mask, position_ids, keep_global, int(num_frames * frame_len)
+
+    # 4D causal mask + partial forward over the full sequence (identical to qadp_llm_prune).
+    causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
+    causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
+
+    hid = embeds
+    attn_w = None
+    for layer in layers[: cfg.work_layer]:
+        layer_kw = dict(attention_mask=causal, position_ids=position_ids,
+                        use_cache=False, output_attentions=True)
+        if position_embeddings is not None:
+            layer_kw["position_embeddings"] = position_embeddings
+        out = layer(hid, **layer_kw)
+        hid = out[0]
+        attn_w = out[1]  # (B, heads, L, L)
+
+    # Per-frame select + merge, preserving temporal order in the kept sequence.
+    keep_video = []
+    eranks = []
+    for f in range(num_frames):
+        block_start = sys_length + f * frame_len
+        final_keep_local, n_f, er_f = _rank_select_and_merge(
+            attn_w, hid, embeds, block_start, frame_len, rank, cfg
+        )
+        keep_video.append(block_start + final_keep_local)
+        eranks.append(er_f)
+
+    keep_video = torch.cat(keep_video)  # (total_kept,) global indices
+    keep_global = torch.cat([
+        torch.arange(0, sys_length, device=dev, dtype=torch.long),
+        keep_video,
+        torch.arange(sys_length + num_frames * frame_len, seq_len, device=dev, dtype=torch.long),
+    ])
+    new_embeds = embeds[:, keep_global, :]
+    new_attn_mask = attention_mask[:, keep_global] if attention_mask is not None else None
+    new_pos = torch.arange(new_embeds.shape[1], device=dev, dtype=torch.long).unsqueeze(0)
+
+    if on_selected is not None:
+        on_selected(float(sum(eranks) / max(1, len(eranks))))
+
+    return new_embeds, new_attn_mask, new_pos, keep_global, int(keep_video.numel())
