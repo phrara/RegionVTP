@@ -56,6 +56,42 @@ class LlavaOnevisionQADP(LlavaOnevisionForConditionalGeneration):
         image_length = int(image_features.shape[0]) - num_images
         return sys_length, image_length
 
+    def _autoregressive_generate(self, inputs_embeds: torch.Tensor, max_new_tokens: int = 128):
+        """Greedy decode loop over ``self.language_model`` (mirrors STC/ReKV ``question_answering``).
+
+        LLaVA-OneVision's ``generate(inputs_embeds=...)`` path degenerates into repetition,
+        so we drive ``language_model`` directly: one prefill over the full (possibly pruned)
+        ``inputs_embeds``, then per-token decode with ``past_key_values``. Returns a ``(1, T)``
+        long tensor of generated token ids only (no prompt prefix).
+        """
+        eos = self.generation_config.eos_token_id
+        if eos is None:
+            eos = self.config.eos_token_id
+        if isinstance(eos, (list, tuple)):
+            eos_set = set(int(e) for e in eos)
+        elif eos is not None:
+            eos_set = {int(eos)}
+        else:
+            eos_set = set()
+
+        device = inputs_embeds.device
+        out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True)
+        past_key_values = out.past_key_values
+        next_token = out.logits[0, -1].argmax(dim=-1)  # 0-dim scalar
+
+        generated = [int(next_token.item())]
+        for _ in range(max_new_tokens - 1):
+            if generated[-1] in eos_set:
+                break
+            out = self.language_model(
+                input_ids=next_token.unsqueeze(0), use_cache=True, past_key_values=past_key_values
+            )
+            past_key_values = out.past_key_values
+            next_token = out.logits[0, -1].argmax(dim=-1)
+            generated.append(int(next_token.item()))
+
+        return torch.tensor([generated], device=device, dtype=torch.long)
+
     @torch.no_grad()
     def generate(
         self,
@@ -118,17 +154,18 @@ class LlavaOnevisionQADP(LlavaOnevisionForConditionalGeneration):
                 )
                 inputs_embeds, attention_mask, position_ids = new_embeds, new_mask, new_pos
 
-            # Pruned (or, if image_length==0, full) embeds -> standard generate, no pixel inputs.
-            # NOTE: with `inputs_embeds` (and no `input_ids`), generate() returns ONLY the
-            # generated tokens — the prompt has no token ids to prepend. So the caller must
-            # decode the whole output (prompt offset = 0), unlike the input_ids baseline path.
+            # QADP path: drive `language_model` directly with an explicit autoregressive loop
+            # (mirrors STC/ReKV's `question_answering`). We avoid `super().generate(inputs_embeds=...)`
+            # here: LLaVA-OneVision's generate() path mis-handles the inputs_embeds prompt and
+            # degenerates into repetition, whereas a manual prefill + decode loop is exactly
+            # what ReKV ships and is proven correct.
+            max_new_tokens = int(kwargs.pop("max_new_tokens", 128))
+            if kwargs.pop("do_sample", False):
+                raise NotImplementedError("QADP single-image path supports greedy decoding only")
+            out_ids = self._autoregressive_generate(inputs_embeds, max_new_tokens=max_new_tokens)
+            # Returned tensor holds generated tokens only (no prompt ids) — decode it in full.
             self._qadp_input_len = 0
-            return super().generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **kwargs,
-            )
+            return out_ids
 
         # Baseline: delegate unchanged.
         self._qadp_input_len = int(input_ids.shape[1]) if input_ids is not None else None
