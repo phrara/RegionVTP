@@ -218,7 +218,7 @@ def _partial_forward(embeds, position_ids, position_embeddings, layers, work_lay
             hid = layer(hid, attention_mask=causal, position_ids=position_ids,
                         use_cache=False, output_attentions=False,
                         position_embeddings=position_embeddings)[0]
-        return hid, _last_token_attention(work[-1], hid_in, position_embeddings)
+        return hid, _last_token_attention(work[-1].self_attn, hid_in, position_embeddings)
 
     # Fallback: original eager path (float additive mask, full attention weights).
     causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
