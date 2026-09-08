@@ -246,7 +246,39 @@ def _partial_forward(embeds, position_ids, position_embeddings, layers, work_lay
     return hid, attn_w.mean(dim=1)[0, -1, :]
 
 
-def _rank_select_and_merge(q2img_full, hid, embeds, block_start, block_len, rank, cfg):
+def _sv_row_contrib(img_hid, block_len):
+    """Row-wise |U·S| contribution of one block (SVD or Gram-eigh, per block shape).
+
+    ``img_hid`` is ``(block_len, D)`` float32.  For tall-skinny blocks (video frames,
+    block_len=196) the Gram-matrix eigendecomposition is mathematically identical to the SVD
+    (|U·S| is sign/order-invariant) but replaces LAPACK's slow gesdd with a dense GEMM + a
+    tiny eigh.
+    """
+    if block_len <= _GRAM_EIGH_MAX:
+        C = img_hid @ img_hid.T  # (block_len, block_len)
+        eigvals, U = torch.linalg.eigh(C)
+        S = torch.sqrt(torch.clamp(eigvals, min=1e-12))
+        return (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
+    U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
+    return (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
+
+
+def _sv_row_contrib_batched(img_hid, block_len):
+    """Batched ``_sv_row_contrib`` over a leading frame dim: ``img_hid`` is ``(F, N, D)``.
+
+    One batched GEMM + eigh (or svd) over all frames amortizes the per-frame kernel /
+    cuSOLVER launch overhead that dominates 64 sequential small SVD/eigh calls.
+    """
+    if block_len <= _GRAM_EIGH_MAX:
+        C = img_hid @ img_hid.transpose(-1, -2)  # (F, N, N)
+        eigvals, U = torch.linalg.eigh(C)
+        S = torch.sqrt(torch.clamp(eigvals, min=1e-12))
+        return (U * S.unsqueeze(-1)).abs().sum(dim=-1)  # (F, N)
+    U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
+    return (U * S.unsqueeze(-1)).abs().sum(dim=-1)  # (F, N)
+
+
+def _rank_select_and_merge(q2img_full, hid, embeds, block_start, block_len, rank, cfg, row_contrib=None):
     """Select + prune-then-merge one contiguous block of visual tokens.
 
     Faithful extraction of ``qadp_llm_prune``'s per-block logic (the AV/SV rank fusion and
@@ -269,22 +301,12 @@ def _rank_select_and_merge(q2img_full, hid, embeds, block_start, block_len, rank
     q2img = q2img_full[block_slice]  # (block_len,)
     _, av_order = torch.sort(q2img, descending=True)
 
-    # SV: SVD row contribution of the contextualized block tokens.
+    # SV: SVD row contribution of the contextualized block tokens.  ``row_contrib`` may be
+    # pre-computed in a batched pass over all frames (the per-frame SVD/eigh has high GPU /
+    # cuSOLVER launch overhead); when None it is computed here for this single block.
     img_hid = hid[0, block_slice, :].to(torch.float32)  # (block_len, D)
-    if block_len <= _GRAM_EIGH_MAX:
-        # Tall-skinny block (e.g. a 196-token video frame): the SVD's U/S are the
-        # eigenvectors/eigenvalues of the Gram matrix C = X X^T — mathematically identical
-        # (|U*S| is invariant to sign/order) — but C's eigendecomposition is a dense GEMM +
-        # a tiny eigh, far faster on GPU than LAPACK's tall-skinny gesdd.
-        C = img_hid @ img_hid.T  # (block_len, block_len)
-        eigvals, U = torch.linalg.eigh(C)
-        S = torch.sqrt(torch.clamp(eigvals, min=1e-12))
-        row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
-    else:
-        # Large/near-square block (M0 anyres multi-crop): keep the direct SVD — eigh of an
-        # (N, N) matrix is O(N^3) and would be slower than gesdd once N approaches D.
-        U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
-        row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
+    if row_contrib is None:
+        row_contrib = _sv_row_contrib(img_hid, block_len)
     _, sv_order = torch.sort(row_contrib, descending=True)
 
     # rank fusion: positional weighting (TokenCarve AV/SV fusion).
@@ -461,13 +483,20 @@ def qadp_llm_prune_frames(
         embeds, position_ids, position_embeddings, layers, cfg.work_layer
     )
 
+    # SV (the SVD/eigh) for ALL frames is computed in one batched pass first: 64 sequential
+    # small SVD/eigh calls are dominated by per-call GPU/cuSOLVER launch overhead, so batching
+    # fills the GPU and amortizes it.  The AV/SV fusion + merge stay per-frame (cheap).
+    video_hid = hid[0, sys_length:sys_length + num_frames * frame_len, :].to(torch.float32)
+    row_contrib_all = _sv_row_contrib_batched(video_hid.view(num_frames, frame_len, -1), frame_len)
+
     # Per-frame select + merge, preserving temporal order in the kept sequence.
     keep_video = []
     eranks = []
     for f in range(num_frames):
         block_start = sys_length + f * frame_len
         final_keep_local, n_f, er_f = _rank_select_and_merge(
-            q2img_full, hid, embeds, block_start, frame_len, rank, cfg
+            q2img_full, hid, embeds, block_start, frame_len, rank, cfg,
+            row_contrib=row_contrib_all[f],
         )
         keep_video.append(block_start + final_keep_local)
         eranks.append(er_f)
