@@ -102,39 +102,89 @@ Cacher 只在「同一视觉塔连续处理多帧」时才有收益——单图�
   ```
 
 - **入口命令 B（融合 pipeline 端到端问答，四个开关组合）**：
+
   ```bash
   M="--model-path /groups/g900403/home/share/phr/models/llava-onevision-qwen2-7b-ov-hf/"
   V="--video ../test3.mp4"                # 或 --image-dir 目录 / 省略走合成帧
   # ⚠️ prompt 带空格，必须内联双引号，别放进变量（$P 展开时引号不重解析，会被空格拆散）
+  # ⚠️ 测延迟一律加 --warmup 1：付掉 cacher 一次性图捕获(~155ms) + CUDA 暖机，见下方说明
+  ```
 
+  **16 帧（默认，`--num-frames` 不写 = 16，对照 cacher 基础收益）**：
+  ```bash
   # ① 基线（纯 OneVision）
-  python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
+  python scripts/onevision/run_video_qa.py $M $V --warmup 1 --prompt "What is happening in this video?"
 
   # ② 只 cacher（帧间复用）
   STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
-    python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
+    python scripts/onevision/run_video_qa.py $M $V --warmup 1 --prompt "What is happening in this video?"
 
   # ③ 只 QADP（帧内逐帧剪枝，TCARVE_RANK=每帧保留 token 数）
   LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
-    python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
+    python scripts/onevision/run_video_qa.py $M $V --warmup 1 --prompt "What is happening in this video?"
 
   # ④ 融合（帧间 cacher + 帧内逐帧 QADP）
   STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
     LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
-    python scripts/onevision/run_video_qa.py $M $V --prompt "What is happening in this video?"
+    python scripts/onevision/run_video_qa.py $M $V --warmup 1 --prompt "What is happening in this video?"
+  ```
+
+  **64 帧（流式摊销，cacher 逼近 21% 稳态收益）**——同上，只追加 `--num-frames 64`；若 mp4 抽不够就省略 `$V` 走合成帧：
+  ```bash
+  # ① 基线
+  python scripts/onevision/run_video_qa.py $M $V --num-frames 64 --warmup 1 --prompt "What is happening in this video?"
+
+  # ② 只 cacher
+  STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
+    python scripts/onevision/run_video_qa.py $M $V --num-frames 64 --warmup 1 --prompt "What is happening in this video?"
+
+  # ③ 只 QADP
+  LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
+    python scripts/onevision/run_video_qa.py $M $V --num-frames 64 --warmup 1 --prompt "What is happening in this video?"
+
+  # ④ 融合
+  STC_PATCH_VISION=1 STC_UPDATE_TOKEN_RATIO=0.25 STC_CACHE_INTERVAL=4 \
+    LLM_LAYER_PRUNE=1 TCARVE_RANK=64 \
+    python scripts/onevision/run_video_qa.py $M $V --num-frames 64 --warmup 1 --prompt "What is happening in this video?"
   ```
 
   每个命令现在会打印**分阶段耗时**（CUDA event，ms），四个组合各跑一次即可对照每一档的边际贡献：
 
   | 阶段 | 看什么 |
   |---|---|
-  | `ViT` | 逐帧 SigLIP 编码 —— **cacher 的收益点**（②/④ 应比 ①/③ ↓20-22%） |
+  | `ViT` | 逐帧 SigLIP 编码 —— **cacher 的收益点**（②/④ 应比 ①/③ 低；幅度见下方） |
   | `QADP` | partial forward + 逐帧 select/merge —— QADP 的**额外开销**（仅 ③/④ 出现） |
   | `prefill` | LLM prefill —— **QADP 的收益点**（③/④ 因 seq 3152→528 应明显变短） |
   | `decode` | LLM 逐 token decode —— 与输出长度挂钩，**与开关无关**，是 wall 的主导项 |
-  | `wall` | 总墙钟（之前 1.59 / 1.55 / 1.49 / 1.80，decode 淹没了 ViT/prefill 的节省） |
+  | `wall` | 总墙钟（decode 占大头，会淹没 ViT/prefill 的节省） |
 
   > 之前的 wall 对比看不出效果，就是因为 decode 占大头；分阶段后单独看 `ViT` 行（cacher）和 `prefill` 行（QADP）才不被 decode 长度干扰。
+
+  **cacher 的收益怎么算（实测 test3.mp4 火灾视频）**：cacher 的「快」靠 **CUDA-graph 回放**——第一个 selective 帧会**捕获图（~155ms 一次性，3 次 side-stream warmup + 1 次捕获）**，之后所有帧回放。所以：
+  - **不加 `--warmup`**：这笔 155ms 落在 `ViT` 行里，16 帧短视频 cacher 反而 +35% 慢（563 vs 417ms）；
+  - **加 `--warmup 1`**：16 帧 ↓5.7%（149.8 vs 158.9）、64 帧 ↓15.8%（537.6 vs 638.3），**帧数越大越逼近稳态 21%**（selective 每帧 7.8ms vs 全量 9.9ms——这才是论文 ↓24.5% 的真实来源，bench 只测 tower 所以显 20-22%）。
+  - 结论：**cacher 是流式结构，长视频/流式才划算**；短视频甚至倒挂。测延迟务必 `--warmup 1` + 拉大 `--num-frames`。
+
+  **实测结果（test3.mp4 火灾视频，全部 `--warmup 1`，单位 ms）**：
+
+  | 帧数 | 组合 | ViT | QADP | prefill | decode (tok) | wall |
+  |---|---|---|---|---|---|---|
+  | 16 | ① 基线 | 160.3 | — | 331.5 | 565.8 (24) | 1.69s |
+  | 16 | ② cacher | 138.2 | — | 326.9 | 558.6 (24) | 1.73s |
+  | 16 | ③ QADP | 156.9 | 468.2 | 63.9 | 406.3 (18) | 1.68s |
+  | 16 | ④ 融合 | 134.2 | 441.6 | 63.7 | 429.9 (20) | 1.77s |
+  | 64 | ① 基线 | 642.0 | — | 1751.4 | 4003.3 (92) | 7.89s |
+  | 64 | ② cacher | 536.8 | — | 1740.8 | 4771.9 (110) | 8.54s |
+  | 64 | ③ QADP | 630.4 | 1968.9 | 171.7 | 518.8 (24) | 4.70s |
+  | 64 | ④ 融合 | 537.2 | 1890.6 | 171.4 | 540.8 (25) | 4.63s |
+
+  **三点结论**：
+
+  1. **cacher（快）稳定生效**：`ViT` 行 ②vs① 16 帧 ↓13.8%（138.2 vs 160.3）、64 帧 ↓16.4%（536.8 vs 642.0），④ 融合里同样生效（134.2 / 537.2）。端到端幅度被 projector/pooling 稀释，摊销后逼近稳态 21%。
+  2. **QADP（准）prefill 节省巨大、但自身开销倒挂**：prefill ①vs③ 16 帧 ↓80.7%（331.5→63.9）、64 帧 ↓90.2%（1751.4→171.7）；但 `QADP` 行本身 468.2 / 1968.9ms（≈O(seq) 的全序列 partial forward），`prefill+QADP` 净账 16 帧 +200.6ms、64 帧 +389.2ms——**QADP 当「快」用是亏的**。它的正确定位是「准」：seq 3152→528 / 12560→2064（token 预算 1/6）下答案质量保持。
+  3. **`wall`/`decode` 跨臂不可比（答案长度漂移）**：64 帧 ① 答案 92 tok（decode 4003ms）vs ③④ 答案 24-25 tok（decode ~520ms），wall 的巨大差异主要来自**生成答案变短**（QADP 改变了输出），不是算力节省。所以延迟对比只看 `ViT`/`QADP`/`prefill` 三行，不看 `decode`/`wall`。
+
+  **关键优化（已实施 2026-09-08，待远程验证）**：砍 QADP 开销。原 452→1969ms 大头是 partial forward 在全序列上 `output_attentions=True`（SDPA 不支持、回退 eager，日志有 warning，且物化 `(28,L,L)` 权重）。QADP 的 AV 项只需「最后一个 question token 对图像 token 的一行注意力」，已改为 **SDPA 前向 + 单行注意力重建**（`qadp_core.py::_partial_forward` / `_last_token_attention`）：前向用 `output_attentions=False`（SDPA 融合 kernel，O(L²) 但不物化、不回退 eager），AV 项只算最后一个 query 的一行（O(L)），SV 项不变。设 `QADP_EAGER_ATTN=1` 可回退旧 eager 路径（A/B 确认两路 AV 排名一致）。预期 QADP 行从 468/1969ms 降数倍，剩逐帧 SVD 开销（若成新瓶颈再批量化）。
 
 - **验收**：
   - 不压缩基线准确率/延迟能复现（OVO 实时 64.4、ViT 编码 103.7 等）；

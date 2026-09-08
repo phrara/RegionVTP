@@ -143,13 +143,110 @@ def read_qadp_env(visual_token_num: int) -> QADPConfig:
     )
 
 
-def _rank_select_and_merge(attn_w, hid, embeds, block_start, block_len, rank, cfg):
+def _rotate_half(x):
+    """90° rotation of the trailing-dim feature pairs (GPT-NeoX RoPE half-rotation)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _last_token_attention(attn, hid_in, position_embeddings):
+    """Head-averaged attention of the last query token to every key token (the AV term).
+
+    Equivalent to the ``-1`` row of ``attn(hid_in, output_attentions=True)``'s weights
+    averaged over heads, but computed with a single query — O(L) instead of O(L²) — and
+    without forcing the SDPA→eager fallback (the QADP overhead source).  ``attn`` is a Qwen2
+    attention module (``q_proj``/``k_proj``/``num_heads``/``num_key_value_heads``/
+    ``head_dim``/``scaling``); ``position_embeddings`` is the ``(cos, sin)`` RoPE tuple
+    (``(B, L, head_dim)`` each), exactly as the layer consumes it.
+    """
+    bsz, q_len, _ = hid_in.shape
+
+    q = attn.q_proj(hid_in[:, -1:, :])              # (B, 1, D) — only the last query
+    k = attn.k_proj(hid_in)                         # (B, L, kv_D)
+    if hasattr(attn, "q_norm"):                     # Qwen2.5+ applies q/k RMSNorm pre-RoPE
+        q = attn.q_norm(q)
+    if hasattr(attn, "k_norm"):
+        k = attn.k_norm(k)
+
+    q = q.view(bsz, 1, attn.num_heads, attn.head_dim).transpose(1, 2)                # (B, heads, 1, H)
+    k = k.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)  # (B, kv, L, H)
+
+    cos, sin = position_embeddings                  # (B, L, H) each
+    cos_q = cos[:, -1:, :].unsqueeze(1)             # (B, 1, 1, H) — last position only
+    sin_q = sin[:, -1:, :].unsqueeze(1)
+    q = (q * cos_q) + (_rotate_half(q) * sin_q)
+    cos_k = cos.unsqueeze(1)                        # (B, 1, L, H) — all key positions
+    sin_k = sin.unsqueeze(1)
+    k = (k * cos_k) + (_rotate_half(k) * sin_k)
+
+    n_rep = attn.num_heads // attn.num_key_value_heads
+    k = k.repeat_interleave(n_rep, dim=1)           # (B, heads, L, H) — GQA broadcast
+
+    scaling = getattr(attn, "scaling", attn.head_dim ** -0.5)
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scaling              # (B, heads, 1, L)
+    weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(hid_in.dtype)
+    return weights.mean(dim=1)[0, 0, :]             # (L,) head-averaged last-row attention
+
+
+def _partial_forward(embeds, position_ids, position_embeddings, layers, work_layer):
+    """Run ``layers[:work_layer]`` over the full sequence; return ``(hid, q2img_full)``.
+
+    ``q2img_full`` is the head-averaged last-row attention ``(seq_len,)`` used by the AV
+    term.  When ``position_embeddings`` is provided (Qwen2, the OneVision path) we run the
+    layers with SDPA (``output_attentions=False``) and reconstruct the single attention row
+    in O(L) — avoiding the O(L²) eager fallback that ``output_attentions=True`` triggers.
+    When it is None (Vicuna/Llama on transformers 4.37, which derive RoPE from
+    ``position_ids`` internally) we keep the original eager ``output_attentions=True`` path.
+    Set ``QADP_EAGER_ATTN=1`` to force the eager path even when ``position_embeddings`` is
+    available (A/B to confirm the two AV terms rank identically).
+    """
+    bsz, seq_len, dim = embeds.shape
+    dev = embeds.device
+    dtype = embeds.dtype
+    work = layers[:work_layer]
+
+    if position_embeddings is not None and os.environ.get("QADP_EAGER_ATTN", "0") != "1":
+        causal = torch.triu(
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=dev), diagonal=1
+        ).unsqueeze(0).unsqueeze(0)                 # (1, 1, L, L), True = masked (causal)
+        hid = embeds
+        hid_in = embeds
+        for i, layer in enumerate(work):
+            if i == len(work) - 1:
+                hid_in = hid                        # input to the last layer -> AV term
+            hid = layer(hid, attention_mask=causal, position_ids=position_ids,
+                        use_cache=False, output_attentions=False,
+                        position_embeddings=position_embeddings)[0]
+        return hid, _last_token_attention(work[-1], hid_in, position_embeddings)
+
+    # Fallback: original eager path (float additive mask, full attention weights).
+    causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
+    causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)
+    hid = embeds
+    attn_w = None
+    for layer in work:
+        layer_kw = dict(attention_mask=causal, position_ids=position_ids,
+                        use_cache=False, output_attentions=True)
+        if position_embeddings is not None:
+            layer_kw["position_embeddings"] = position_embeddings
+        out = layer(hid, **layer_kw)
+        hid = out[0]
+        attn_w = out[1]
+    return hid, attn_w.mean(dim=1)[0, -1, :]
+
+
+def _rank_select_and_merge(q2img_full, hid, embeds, block_start, block_len, rank, cfg):
     """Select + prune-then-merge one contiguous block of visual tokens.
 
     Faithful extraction of ``qadp_llm_prune``'s per-block logic (the AV/SV rank fusion and
     the prune-then-merge fold), parameterised by ``block_start``/``block_len`` so it can be
     reused for the single-image block (M0) and for **each frame** in the per-frame video
     path.  ``rank`` must already be capped to ``[2, block_len]`` by the caller.
+
+    ``q2img_full`` is the head-averaged attention of the last query token to every token
+    (``(seq_len,)``); this function slices out the block's ``[block_start, block_start +
+    block_len)`` portion for the AV term.
 
     Returns ``(final_keep_local, n_kept, erank)`` where ``final_keep_local`` holds
     block-relative indices (into ``[block_start, block_start + block_len)``).
@@ -159,7 +256,7 @@ def _rank_select_and_merge(attn_w, hid, embeds, block_start, block_len, rank, cf
     block_slice = slice(block_start, block_start + block_len)
 
     # AV: last input token's (question) attention to each block token, mean over heads.
-    q2img = attn_w.mean(dim=1)[0, -1, block_slice]  # (block_len,)
+    q2img = q2img_full[block_slice]  # (block_len,)
     _, av_order = torch.sort(q2img, descending=True)
 
     # SV: SVD row contribution of the contextualized block tokens.
@@ -238,12 +335,14 @@ def qadp_llm_prune(
     """TokenCarve-style LLM-layer pruning (rank-fusion + prune-then-merge).
 
     Faithful port of ``llava_arch.py:token_carve_llm_prune`` (:625-767). Runs the first
-    ``cfg.work_layer`` decoder layers over the FULL image-token sequence with
-    ``output_attentions=True`` to get question-aware attention + contextualized hidden
-    states, then re-selects image tokens by fusing (AV) the last input token's attention
-    to each image token and (SV) each image token's SVD row contribution. Assumes
-    batch_size=1 and a single contiguous image-token block at ``[sys_length, sys_length
-    + image_length)``.
+    ``cfg.work_layer`` decoder layers over the FULL image-token sequence to get
+    question-aware attention + contextualized hidden states, then re-selects image tokens
+    by fusing (AV) the last input token's attention to each image token and (SV) each image
+    token's SVD row contribution. The AV term needs only the last query's attention row, so
+    on Qwen2 it is computed in O(L) via a single query (see ``_partial_forward``) instead of
+    materializing the full ``output_attentions=True`` O(L²) weights (which forces the
+    SDPA→eager fallback). Assumes batch_size=1 and a single contiguous image-token block at
+    ``[sys_length, sys_length + image_length)``.
 
     Returns ``(new_embeds (1,L',D), new_attn_mask (1,L')|None, new_pos (1,L'),
     keep_global (L',), final_image_count int)``.
@@ -265,27 +364,16 @@ def qadp_llm_prune(
         keep_global = torch.arange(seq_len, device=dev, dtype=torch.long)
         return embeds, attention_mask, position_ids, keep_global, int(image_length)
 
-    # 4D causal mask for the partial (prefill) forward over the full sequence.
-    causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
-    causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
-
-    # pass 1: layers 0..work_layer-1 over the full sequence -> question-aware attn + hidden.
-    hid = embeds
-    attn_w = None
-    for layer in layers[: cfg.work_layer]:
-        layer_kw = dict(attention_mask=causal, position_ids=position_ids,
-                        use_cache=False, output_attentions=True)
-        if position_embeddings is not None:
-            # transformers >= 4.46 Qwen2/Qwen3 layers require the precomputed RoPE
-            # (cos, sin) tuple; Vicuna/Llama (4.37.2) computes RoPE from position_ids
-            # internally and must NOT receive this kwarg.
-            layer_kw["position_embeddings"] = position_embeddings
-        out = layer(hid, **layer_kw)
-        hid = out[0]
-        attn_w = out[1]  # (B, heads, L, L)
+    # pass 1: layers 0..work_layer-1 over the full sequence -> question-aware attention (AV)
+    # + contextualized hidden states (SV).  The AV term needs only the LAST query's
+    # attention row, so on Qwen2 it is reconstructed in O(L) (see _partial_forward) instead
+    # of materializing the full O(L²) attention weights via output_attentions=True.
+    hid, q2img_full = _partial_forward(
+        embeds, position_ids, position_embeddings, layers, cfg.work_layer
+    )
 
     final_keep_local, n_kept, er = _rank_select_and_merge(
-        attn_w, hid, embeds, sys_length, image_length, rank, cfg
+        q2img_full, hid, embeds, sys_length, image_length, rank, cfg
     )
 
     # global keep indices: prefix + kept image tokens + suffix.
@@ -345,20 +433,11 @@ def qadp_llm_prune_frames(
         keep_global = torch.arange(seq_len, device=dev, dtype=torch.long)
         return embeds, attention_mask, position_ids, keep_global, int(num_frames * frame_len)
 
-    # 4D causal mask + partial forward over the full sequence (identical to qadp_llm_prune).
-    causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
-    causal = torch.triu(causal, diagonal=1).unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
-
-    hid = embeds
-    attn_w = None
-    for layer in layers[: cfg.work_layer]:
-        layer_kw = dict(attention_mask=causal, position_ids=position_ids,
-                        use_cache=False, output_attentions=True)
-        if position_embeddings is not None:
-            layer_kw["position_embeddings"] = position_embeddings
-        out = layer(hid, **layer_kw)
-        hid = out[0]
-        attn_w = out[1]  # (B, heads, L, L)
+    # Partial forward over the full sequence (identical to qadp_llm_prune; see
+    # _partial_forward for the single-row AV optimization that avoids the O(L²) eager fallback).
+    hid, q2img_full = _partial_forward(
+        embeds, position_ids, position_embeddings, layers, cfg.work_layer
+    )
 
     # Per-frame select + merge, preserving temporal order in the kept sequence.
     keep_video = []
@@ -366,7 +445,7 @@ def qadp_llm_prune_frames(
     for f in range(num_frames):
         block_start = sys_length + f * frame_len
         final_keep_local, n_f, er_f = _rank_select_and_merge(
-            attn_w, hid, embeds, block_start, frame_len, rank, cfg
+            q2img_full, hid, embeds, block_start, frame_len, rank, cfg
         )
         keep_video.append(block_start + final_keep_local)
         eranks.append(er_f)
