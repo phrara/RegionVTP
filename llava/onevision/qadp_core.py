@@ -217,15 +217,16 @@ def _partial_forward(embeds, position_ids, position_embeddings, layers, work_lay
     work = layers[:work_layer]
 
     if position_embeddings is not None and os.environ.get("QADP_EAGER_ATTN", "0") != "1":
-        causal = torch.triu(
-            torch.ones((seq_len, seq_len), dtype=torch.bool, device=dev), diagonal=1
-        ).unsqueeze(0).unsqueeze(0)                 # (1, 1, L, L), True = masked (causal)
+        # SDPA forward.  Pass attention_mask=None so the layer derives is_causal=True and SDPA
+        # uses its fused causal kernel — an explicit (1,1,L,L) bool mask forces the slower
+        # explicit-mask path (no fused causal kernel + an L×L mask read per layer).  Full
+        # causal is what the old eager path computed too, so the AV/SV terms are unchanged.
         hid = embeds
         hid_in = embeds
         for i, layer in enumerate(work):
             if i == len(work) - 1:
                 hid_in = hid                        # input to the last layer -> AV term
-            hid = layer(hid, attention_mask=causal, position_ids=position_ids,
+            hid = layer(hid, attention_mask=None, position_ids=position_ids,
                         use_cache=False, output_attentions=False,
                         position_embeddings=position_embeddings)[0]
         return hid, _last_token_attention(work[-1].self_attn, hid_in, position_embeddings)
