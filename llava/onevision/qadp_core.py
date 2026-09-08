@@ -155,24 +155,28 @@ def _last_token_attention(attn, hid_in, position_embeddings):
 
     Equivalent to the ``-1`` row of ``attn(hid_in, output_attentions=True)``'s weights
     averaged over heads, but computed with a single query — O(L) instead of O(L²) — and
-    without forcing the SDPA→eager fallback (the QADP overhead source).  ``attn`` is a Qwen2
-    attention module (``q_proj``/``k_proj``/``num_heads``/``num_key_value_heads``/
-    ``head_dim``/``scaling``); ``position_embeddings`` is the ``(cos, sin)`` RoPE tuple
-    (``(B, L, head_dim)`` each), exactly as the layer consumes it.
+    without forcing the SDPA→eager fallback (the QADP overhead source).  Head geometry is
+    derived from the projection output widths and the RoPE ``cos`` shape (not from
+    version-specific attribute names like ``num_heads``); ``position_embeddings`` is the
+    ``(cos, sin)`` RoPE tuple (``(B, L, head_dim)`` each), exactly as the layer consumes it.
     """
     bsz, q_len, _ = hid_in.shape
 
-    q = attn.q_proj(hid_in[:, -1:, :])              # (B, 1, D) — only the last query
-    k = attn.k_proj(hid_in)                         # (B, L, kv_D)
+    q = attn.q_proj(hid_in[:, -1:, :])              # (B, 1, num_heads * head_dim)
+    k = attn.k_proj(hid_in)                         # (B, L, num_kv_heads * head_dim)
     if hasattr(attn, "q_norm"):                     # Qwen2.5+ applies q/k RMSNorm pre-RoPE
         q = attn.q_norm(q)
     if hasattr(attn, "k_norm"):
         k = attn.k_norm(k)
 
-    q = q.view(bsz, 1, attn.num_heads, attn.head_dim).transpose(1, 2)                # (B, heads, 1, H)
-    k = k.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)  # (B, kv, L, H)
+    cos, sin = position_embeddings                  # (B, L, head_dim) each
+    head_dim = cos.shape[-1]
+    num_heads = attn.q_proj.out_features // head_dim
+    num_kv_heads = attn.k_proj.out_features // head_dim
 
-    cos, sin = position_embeddings                  # (B, L, H) each
+    q = q.view(bsz, 1, num_heads, head_dim).transpose(1, 2)                    # (B, heads, 1, H)
+    k = k.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)             # (B, kv, L, H)
+
     cos_q = cos[:, -1:, :].unsqueeze(1)             # (B, 1, 1, H) — last position only
     sin_q = sin[:, -1:, :].unsqueeze(1)
     q = (q * cos_q) + (_rotate_half(q) * sin_q)
@@ -180,10 +184,10 @@ def _last_token_attention(attn, hid_in, position_embeddings):
     sin_k = sin.unsqueeze(1)
     k = (k * cos_k) + (_rotate_half(k) * sin_k)
 
-    n_rep = attn.num_heads // attn.num_key_value_heads
+    n_rep = num_heads // num_kv_heads
     k = k.repeat_interleave(n_rep, dim=1)           # (B, heads, L, H) — GQA broadcast
 
-    scaling = getattr(attn, "scaling", attn.head_dim ** -0.5)
+    scaling = head_dim ** -0.5
     scores = torch.matmul(q, k.transpose(-1, -2)) * scaling              # (B, heads, 1, L)
     weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(hid_in.dtype)
     return weights.mean(dim=1)[0, 0, :]             # (L,) head-averaged last-row attention
