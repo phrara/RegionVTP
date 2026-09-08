@@ -34,6 +34,12 @@ import torch
 ERANK_AVG_REF = 90
 TAU_MAX = 0.25
 
+# Max block_len for which _rank_select_and_merge uses the Gram-matrix eigendecomposition
+# instead of the direct SVD.  The eigh of an (N, N) matrix is O(N^3); it only beats LAPACK's
+# tall-skinny gesdd while N is well below the feature dim (~3584).  Video frames are 196
+# (fast path); M0 anyres multi-crop can be ~4724 (keeps the direct SVD).
+_GRAM_EIGH_MAX = 1024
+
 
 def calculate_adaptive_tau(order_i, erank_input, erank_avg=ERANK_AVG_REF, tau_max=TAU_MAX):
     """Eq. 6: tau_i = order_i * (erank_input / erank_avg * 0.01), capped at tau_max."""
@@ -265,8 +271,20 @@ def _rank_select_and_merge(q2img_full, hid, embeds, block_start, block_len, rank
 
     # SV: SVD row contribution of the contextualized block tokens.
     img_hid = hid[0, block_slice, :].to(torch.float32)  # (block_len, D)
-    U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
-    row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
+    if block_len <= _GRAM_EIGH_MAX:
+        # Tall-skinny block (e.g. a 196-token video frame): the SVD's U/S are the
+        # eigenvectors/eigenvalues of the Gram matrix C = X X^T — mathematically identical
+        # (|U*S| is invariant to sign/order) — but C's eigendecomposition is a dense GEMM +
+        # a tiny eigh, far faster on GPU than LAPACK's tall-skinny gesdd.
+        C = img_hid @ img_hid.T  # (block_len, block_len)
+        eigvals, U = torch.linalg.eigh(C)
+        S = torch.sqrt(torch.clamp(eigvals, min=1e-12))
+        row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
+    else:
+        # Large/near-square block (M0 anyres multi-crop): keep the direct SVD — eigh of an
+        # (N, N) matrix is O(N^3) and would be slower than gesdd once N approaches D.
+        U, S, _ = torch.linalg.svd(img_hid, full_matrices=False)
+        row_contrib = (U * S.unsqueeze(0)).abs().sum(dim=1)  # (block_len,)
     _, sv_order = torch.sort(row_contrib, descending=True)
 
     # rank fusion: positional weighting (TokenCarve AV/SV fusion).
