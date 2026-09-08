@@ -1,6 +1,6 @@
 # 流式方案推进计划：先接入 STC-Cacher
 
-> 更新日期：2026-09-07。
+> 更新日期：2026-09-08。
 > **本轮范围**：先把 STC-Cacher（帧间选择性重算）接入我们的视频底座，拿到帧间复用的延迟收益 + 精度保持。
 > **暂缓**：STC-Pruner 帧内剪枝、以及 QADP 的问题条件化替换（列为后续阶段，不阻塞本轮）。
 
@@ -15,7 +15,8 @@
   - 入口 `scripts/onevision/run_single_image_qadp.py` / `eval_vqa_qadp.py`；依赖 `requirements/onevision.txt`
 - ✅ **独立环境**：transformers==4.49.0（LLaVA-1.5 的 4.37.2 环境一字不动，4 个 bench 锚点零风险）。
 - ✅ **融合 pipeline 已搭好**（M1）：`scripts/onevision/run_video_qa.py` 端到端 `视频 → 逐帧 SigLIP(cacher) → merge → QADP 逐帧剪枝(可选) → LLM prefill+decode`，两个开关 `STC_PATCH_VISION`（帧间 cacher）/ `LLM_LAYER_PRUNE`（帧内 QADP）独立、可叠加。延迟侧已用合成视频验过 ViT ↓20-22%（逼近论文 24.5%）。
-- ⏳ **待做**：真实视频数据 + 不压缩基线精度 + 扫参消融（`update_token_ratio` / `cache_interval` / `TCARVE_RANK`）。
+- ✅ **QADP 自身开销已砍 62%**（64f 1969→744ms，见 §M1「关键优化」），净账从「倒挂」翻正：64f `QADP+prefill` 912ms vs 基线 prefill 1737ms（↓825ms），16f 仍小亏 +102ms——长序列「快」也成立，短序列仍是「准」的定位。
+- ⏳ **待做**：真实视频数据 + 不压缩基线精度 + 扫参消融（`update_token_ratio` / `cache_interval` / `TCARVE_RANK`）；剩余 ~744ms@64f 大头用 `QADP_PROFILE=1` 子阶段计时定位。
 
 ---
 
@@ -169,22 +170,29 @@ Cacher 只在「同一视觉塔连续处理多帧」时才有收益——单图�
 
   | 帧数 | 组合 | ViT | QADP | prefill | decode (tok) | wall |
   |---|---|---|---|---|---|---|
-  | 16 | ① 基线 | 160.3 | — | 331.5 | 565.8 (24) | 1.69s |
-  | 16 | ② cacher | 138.2 | — | 326.9 | 558.6 (24) | 1.73s |
-  | 16 | ③ QADP | 156.9 | 468.2 | 63.9 | 406.3 (18) | 1.68s |
-  | 16 | ④ 融合 | 134.2 | 441.6 | 63.7 | 429.9 (20) | 1.77s |
-  | 64 | ① 基线 | 642.0 | — | 1751.4 | 4003.3 (92) | 7.89s |
-  | 64 | ② cacher | 536.8 | — | 1740.8 | 4771.9 (110) | 8.54s |
-  | 64 | ③ QADP | 630.4 | 1968.9 | 171.7 | 518.8 (24) | 4.70s |
-  | 64 | ④ 融合 | 537.2 | 1890.6 | 171.4 | 540.8 (25) | 4.63s |
+  | 16 | ① 基线 | 157.9 | — | 325.5 | 548.0 (24) | 1.58s |
+  | 16 | ② cacher | 150.2 | — | 318.5 | 534.1 (24) | 1.66s |
+  | 16 | ③ QADP | 152.1 | 366.6 | 60.9 | 533.6 (25) | 1.65s |
+  | 16 | ④ 融合 | 134.4 | 305.3 | 60.7 | 269.1 (13) | 1.43s |
+  | 64 | ① 基线 | 600.1 | — | 1737.5 | 3962.7 (92) | 7.70s |
+  | 64 | ② cacher | 536.8 | — | 2405.5* | 4720.4 (110) | 10.11s |
+  | 64 | ③ QADP | 602.5 | 744.3 | 168.4 | 499.9 (24) | 3.40s |
+  | 64 | ④ 融合 | 537.8 | 696.5 | 168.8 | 618.2 (29) | 3.46s |
+
+  > \* 共享 GPU 争用导致跨 run 噪声：`prefill`/`decode`/`wall` 与开关无关却波动大（64f ② 的 prefill 2405ms 是噪声，cacher 不碰 prefill；基线 ① 自身也 1737 vs 1751 漂移）。延迟对比只看 `ViT`/`QADP`/`prefill` 三行的**同 run 对照**，别跨 run 比。
 
   **三点结论**：
 
   1. **cacher（快）稳定生效**：`ViT` 行 ②vs① 16 帧 ↓13.8%（138.2 vs 160.3）、64 帧 ↓16.4%（536.8 vs 642.0），④ 融合里同样生效（134.2 / 537.2）。端到端幅度被 projector/pooling 稀释，摊销后逼近稳态 21%。
-  2. **QADP（准）prefill 节省巨大、但自身开销倒挂**：prefill ①vs③ 16 帧 ↓80.7%（331.5→63.9）、64 帧 ↓90.2%（1751.4→171.7）；但 `QADP` 行本身 468.2 / 1968.9ms（≈O(seq) 的全序列 partial forward），`prefill+QADP` 净账 16 帧 +200.6ms、64 帧 +389.2ms——**QADP 当「快」用是亏的**。它的正确定位是「准」：seq 3152→528 / 12560→2064（token 预算 1/6）下答案质量保持。
+  2. **QADP（准）prefill 节省巨大、自身开销已从「倒挂」翻正**：prefill ①vs③ 16 帧 ↓81.3%（325.5→60.9）、64 帧 ↓90.3%（1737.5→168.4）；`QADP` 行本身从 468/1969 砍到 367/744ms 后，`QADP+prefill` 净账 64 帧 **−825ms**（912 vs 1737）、16 帧仍 +102ms（427 vs 325）——**长序列 QADP 当「快」也成立，短序列仍主要靠「准」**（seq 3152→528 / 12560→2064，token 预算 1/6，答案质量保持）。
   3. **`wall`/`decode` 跨臂不可比（答案长度漂移）**：64 帧 ① 答案 92 tok（decode 4003ms）vs ③④ 答案 24-25 tok（decode ~520ms），wall 的巨大差异主要来自**生成答案变短**（QADP 改变了输出），不是算力节省。所以延迟对比只看 `ViT`/`QADP`/`prefill` 三行，不看 `decode`/`wall`。
 
-  **关键优化（已实施 2026-09-08，待远程验证）**：砍 QADP 开销。原 452→1969ms 大头是 partial forward 在全序列上 `output_attentions=True`（SDPA 不支持、回退 eager，日志有 warning，且物化 `(28,L,L)` 权重）。QADP 的 AV 项只需「最后一个 question token 对图像 token 的一行注意力」，已改为 **SDPA 前向 + 单行注意力重建**（`qadp_core.py::_partial_forward` / `_last_token_attention`）：前向用 `output_attentions=False`（SDPA 融合 kernel，O(L²) 但不物化、不回退 eager），AV 项只算最后一个 query 的一行（O(L)），SV 项不变。设 `QADP_EAGER_ATTN=1` 可回退旧 eager 路径（A/B 确认两路 AV 排名一致）。预期 QADP 行从 468/1969ms 降数倍，剩逐帧 SVD 开销（若成新瓶颈再批量化）。
+  **关键优化（已实施并验证 2026-09-08）**：砍 QADP 自身开销（`qadp_core.py`）。原 468/1969ms 大头是 partial forward 在全序列上 `output_attentions=True`（SDPA 不支持、回退 eager、物化 `(28,L,L)` 权重）。三层优化：
+  1. **SDPA 前向 + 单行 AV**（`_partial_forward` / `_last_token_attention`）：前向 `output_attentions=False`（SDPA 融合 kernel，O(L²) 不物化、不回退 eager），AV 只算最后一个 query 的一行（O(L) 手工 RoPE/GQA/softmax，与 eager 最后一行逐点等价）。→ 64f 1969→1074ms。
+  2. **Gram-eigh 替代逐帧 SVD**（`_sv_row_contrib`）：|U·S| 改用 Gram 矩阵特征分解（数学等价，196×196 GEMM + 小 eigh 替代 LAPACK gesdd）。→ 1074→805ms。
+  3. **`attention_mask=None` 触发 `is_causal=True`**：显式 `(1,1,L,L)` bool 因果 mask 让 SDPA 走 `is_causal=False` 慢路径（无融合因果 kernel、每层读 157MB mask）；传 None 让层自动设 `is_causal=True`（full causal，与旧 eager 一致）。→ 805→744ms。
+
+  结果：**64f QADP 行 1969→744ms（↓62%）、16f 468→367ms（↓22%）**。设 `QADP_EAGER_ATTN=1` 可回退旧 eager 路径做 A/B。剩余 744ms@64f 大头仍未定位：线性拟合 16f/64f 得固定 ~241ms + 比例 ~0.04ms/token；批量化 eigh 零收益=不是 SVD 本身，is_causal 只省 ~50ms。下一步 `QADP_PROFILE=1` 打子阶段计时（partial forward / 单行 AV / batched SV / 逐帧 merge 循环）定位。
 
 - **验收**：
   - 不压缩基线准确率/延迟能复现（OVO 实时 64.4、ViT 编码 103.7 等）；

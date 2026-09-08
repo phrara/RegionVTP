@@ -25,6 +25,7 @@ Abstractions vs. the original method:
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -39,6 +40,21 @@ TAU_MAX = 0.25
 # tall-skinny gesdd while N is well below the feature dim (~3584).  Video frames are 196
 # (fast path); M0 anyres multi-crop can be ~4724 (keeps the direct SVD).
 _GRAM_EIGH_MAX = 1024
+
+# Sub-stage CUDA-event profiling (diagnostic).  Set QADP_PROFILE=1 to print the per-stage
+# breakdown of the QADP line (partial forward / single-row AV / batched SV / per-frame loop)
+# in ms to stderr.  Purely for locating the remaining ~700ms @64f; removed once confirmed.
+_QADP_PROFILE = os.environ.get("QADP_PROFILE", "0") == "1"
+
+
+def _ev():
+    return torch.cuda.Event(enable_timing=True)
+
+
+def _prof(name, t0, t1):
+    t1.record()
+    torch.cuda.synchronize()
+    print(f"[QADP-profile] {name:24s} = {t0.elapsed_time(t1):7.1f} ms", file=sys.stderr)
 
 
 def calculate_adaptive_tau(order_i, erank_input, erank_avg=ERANK_AVG_REF, tau_max=TAU_MAX):
@@ -221,6 +237,8 @@ def _partial_forward(embeds, position_ids, position_embeddings, layers, work_lay
         # uses its fused causal kernel — an explicit (1,1,L,L) bool mask forces the slower
         # explicit-mask path (no fused causal kernel + an L×L mask read per layer).  Full
         # causal is what the old eager path computed too, so the AV/SV terms are unchanged.
+        if _QADP_PROFILE:
+            t0 = _ev(); t0.record()
         hid = embeds
         hid_in = embeds
         for i, layer in enumerate(work):
@@ -229,7 +247,13 @@ def _partial_forward(embeds, position_ids, position_embeddings, layers, work_lay
             hid = layer(hid, attention_mask=None, position_ids=position_ids,
                         use_cache=False, output_attentions=False,
                         position_embeddings=position_embeddings)[0]
-        return hid, _last_token_attention(work[-1].self_attn, hid_in, position_embeddings)
+        if _QADP_PROFILE:
+            t1 = _ev()
+            _prof("partial_forward", t0, t1)
+        q2img = _last_token_attention(work[-1].self_attn, hid_in, position_embeddings)
+        if _QADP_PROFILE:
+            _prof("last_row_av", t1, _ev())
+        return hid, q2img
 
     # Fallback: original eager path (float additive mask, full attention weights).
     causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=dev, dtype=dtype)
@@ -487,8 +511,13 @@ def qadp_llm_prune_frames(
     # SV (the SVD/eigh) for ALL frames is computed in one batched pass first: 64 sequential
     # small SVD/eigh calls are dominated by per-call GPU/cuSOLVER launch overhead, so batching
     # fills the GPU and amortizes it.  The AV/SV fusion + merge stay per-frame (cheap).
+    if _QADP_PROFILE:
+        t0 = _ev(); t0.record()
     video_hid = hid[0, sys_length:sys_length + num_frames * frame_len, :].to(torch.float32)
     row_contrib_all = _sv_row_contrib_batched(video_hid.view(num_frames, frame_len, -1), frame_len)
+    if _QADP_PROFILE:
+        t1 = _ev()
+        _prof("batched_sv", t0, t1)
 
     # Per-frame select + merge, preserving temporal order in the kept sequence.
     keep_video = []
@@ -501,6 +530,8 @@ def qadp_llm_prune_frames(
         )
         keep_video.append(block_start + final_keep_local)
         eranks.append(er_f)
+    if _QADP_PROFILE:
+        _prof("per_frame_loop", t1, _ev())
 
     keep_video = torch.cat(keep_video)  # (total_kept,) global indices
     keep_global = torch.cat([
